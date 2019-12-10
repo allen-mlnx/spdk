@@ -1042,12 +1042,15 @@ nvme_ctrlr_populate_namespaces(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
 	uint32_t		i;
 	int			rc;
 	uint64_t		num_sectors;
+	bool			ns_is_active = false;
 
 	for (i = 0; i < nvme_bdev_ctrlr->num_ns; i++) {
 		uint32_t	nsid = i + 1;
 
 		ns = nvme_bdev_ctrlr->namespaces[i];
-		if (ns->populated && spdk_nvme_ctrlr_is_active_ns(ctrlr, nsid)) {
+		ns_is_active = spdk_nvme_ctrlr_is_active_ns(ctrlr, nsid);
+
+		if (ns->populated && ns_is_active) {
 			/* NS is still there but attributes may have changed */
 			nvme_ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
 			num_sectors = spdk_nvme_ns_get_num_sectors(nvme_ns);
@@ -1068,7 +1071,7 @@ nvme_ctrlr_populate_namespaces(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
 		}
 
 
-		if (!ns->populated && spdk_nvme_ctrlr_is_active_ns(ctrlr, nsid)) {
+		if (!ns->populated && ns_is_active) {
 			ns->id = nsid;
 			ns->ctrlr = nvme_bdev_ctrlr;
 			if (spdk_nvme_ctrlr_is_ocssd_supported(ctrlr)) {
@@ -1087,7 +1090,7 @@ nvme_ctrlr_populate_namespaces(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
 			}
 		}
 
-		if (ns->populated && !spdk_nvme_ctrlr_is_active_ns(ctrlr, nsid)) {
+		if (ns->populated && !ns_is_active) {
 			nvme_ctrlr_depopulate_namespace(nvme_bdev_ctrlr, ns);
 		}
 	}
