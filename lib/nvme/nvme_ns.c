@@ -365,6 +365,5 @@ void nvme_ns_destruct(struct spdk_nvme_ns *ns)
 
 int nvme_ns_update(struct spdk_nvme_ns *ns)
 {
-	/* @todo: do we need any locks here? there is ctrlr lock in identify ns */
 	return nvme_ctrlr_identify_ns(ns);
 }

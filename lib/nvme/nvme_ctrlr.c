@@ -1744,7 +1744,7 @@ nvme_ctrlr_update_namespaces(struct spdk_nvme_ctrlr *ctrlr)
 {
 	uint32_t i, nn = ctrlr->cdata.nn;
 	struct spdk_nvme_ns_data *nsdata;
-	bool   ns_is_active = false;
+	bool   ns_is_active;
 
 	for (i = 0; i < nn; i++) {
 		struct spdk_nvme_ns	*ns = &ctrlr->ns[i];

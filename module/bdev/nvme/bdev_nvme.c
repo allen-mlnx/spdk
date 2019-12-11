@@ -1037,12 +1037,11 @@ nvme_ctrlr_populate_namespaces(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
 	struct spdk_nvme_ctrlr	*ctrlr = nvme_bdev_ctrlr->ctrlr;
 	struct nvme_bdev_ns	*ns;
 	struct spdk_nvme_ns	*nvme_ns;
-	struct nvme_bdev	*bdev;
-	struct nvme_bdev	*tmp;//delete me
+	struct nvme_bdev	*bdev, *tmp;
 	uint32_t		i;
 	int			rc;
 	uint64_t		num_sectors;
-	bool			ns_is_active = false;
+	bool			ns_is_active;
 
 	for (i = 0; i < nvme_bdev_ctrlr->num_ns; i++) {
 		uint32_t	nsid = i + 1;
