@@ -1069,7 +1069,6 @@ nvme_ctrlr_populate_namespaces(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
 			}
 		}
 
-
 		if (!ns->populated && ns_is_active) {
 			ns->id = nsid;
 			ns->ctrlr = nvme_bdev_ctrlr;
