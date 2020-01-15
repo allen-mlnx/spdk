@@ -185,11 +185,6 @@ struct spdk_nvmf_poll_group {
 	struct spdk_nvmf_poll_group_stat		stat;
 };
 
-typedef enum _spdk_nvmf_request_exec_status {
-	SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE,
-	SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS,
-} spdk_nvmf_request_exec_status;
-
 union nvmf_h2c_msg {
 	struct spdk_nvmf_capsule_cmd			nvmf_cmd;
 	struct spdk_nvme_cmd				nvme_cmd;
@@ -448,6 +443,50 @@ void spdk_nvmf_ns_reservation_request(void *ctx);
 void spdk_nvmf_ctrlr_reservation_notice_log(struct spdk_nvmf_ctrlr *ctrlr,
 		struct spdk_nvmf_ns *ns,
 		enum spdk_nvme_reservation_notification_log_page_type type);
+
+static inline enum spdk_nvme_data_transfer
+spdk_nvmf_req_get_xfer(struct spdk_nvmf_request *req) {
+	enum spdk_nvme_data_transfer xfer;
+	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
+	struct spdk_nvme_sgl_descriptor *sgl = &cmd->dptr.sgl1;
+
+	/* Figure out data transfer direction */
+	if (cmd->opc == SPDK_NVME_OPC_FABRIC)
+	{
+		xfer = spdk_nvme_opc_get_data_transfer(req->cmd->nvmf_cmd.fctype);
+	} else
+	{
+		xfer = spdk_nvme_opc_get_data_transfer(cmd->opc);
+	}
+
+	if (xfer == SPDK_NVME_DATA_NONE)
+	{
+		return xfer;
+	}
+
+	/* Even for commands that may transfer data, they could have specified 0 length.
+	 * We want those to show up with xfer SPDK_NVME_DATA_NONE.
+	 */
+	switch (sgl->generic.type)
+	{
+	case SPDK_NVME_SGL_TYPE_DATA_BLOCK:
+	case SPDK_NVME_SGL_TYPE_BIT_BUCKET:
+	case SPDK_NVME_SGL_TYPE_SEGMENT:
+	case SPDK_NVME_SGL_TYPE_LAST_SEGMENT:
+	case SPDK_NVME_SGL_TYPE_TRANSPORT_DATA_BLOCK:
+		if (sgl->unkeyed.length == 0) {
+			xfer = SPDK_NVME_DATA_NONE;
+		}
+		break;
+	case SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK:
+		if (sgl->keyed.length == 0) {
+			xfer = SPDK_NVME_DATA_NONE;
+		}
+		break;
+	}
+
+	return xfer;
+}
 
 /*
  * Abort aer is sent on a per controller basis and sends a completion for the aer to the host.

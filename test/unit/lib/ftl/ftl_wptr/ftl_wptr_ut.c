@@ -49,11 +49,6 @@ static struct spdk_ocssd_geometry_data g_geo = {
 	.ws_min		= 4,
 };
 
-static struct spdk_ftl_punit_range g_range = {
-	.begin		= 2,
-	.end		= 9,
-};
-
 #if defined(DEBUG)
 DEFINE_STUB(ftl_band_validate_md, bool, (struct ftl_band *band), true);
 #endif
@@ -66,7 +61,7 @@ DEFINE_STUB_V(ftl_reloc_add, (struct ftl_reloc *reloc, struct ftl_band *band, si
 			      size_t num_lbks, int prio, bool defrag));
 DEFINE_STUB_V(ftl_trace_write_band, (struct spdk_ftl_dev *dev, const struct ftl_band *band));
 DEFINE_STUB_V(ftl_trace_submission, (struct spdk_ftl_dev *dev, const struct ftl_io *io,
-				     struct ftl_ppa ppa, size_t ppa_cnt));
+				     struct ftl_addr addr, size_t addr_cnt));
 DEFINE_STUB_V(ftl_rwb_get_limits, (struct ftl_rwb *rwb, size_t limit[FTL_RWB_TYPE_MAX]));
 DEFINE_STUB_V(ftl_io_process_error, (struct ftl_io *io, const struct spdk_nvme_cpl *status));
 DEFINE_STUB_V(ftl_trace_limits, (struct spdk_ftl_dev *dev, const size_t *limits, size_t num_free));
@@ -109,15 +104,14 @@ ftl_io_complete(struct ftl_io *io)
 }
 
 static void
-setup_wptr_test(struct spdk_ftl_dev **dev, const struct spdk_ocssd_geometry_data *geo,
-		const struct spdk_ftl_punit_range *range)
+setup_wptr_test(struct spdk_ftl_dev **dev, const struct spdk_ocssd_geometry_data *geo)
 {
 	size_t i;
 	struct spdk_ftl_dev *t_dev;
 
-	t_dev = test_init_ftl_dev(geo, range);
+	t_dev = test_init_ftl_dev(geo);
 
-	for (i = 0; i < ftl_dev_num_bands(t_dev); ++i) {
+	for (i = 0; i < ftl_get_num_bands(t_dev); ++i) {
 		test_init_ftl_band(t_dev, i);
 		t_dev->bands[i].state = FTL_BAND_STATE_CLOSED;
 		ftl_band_set_state(&t_dev->bands[i], FTL_BAND_STATE_FREE);
@@ -131,7 +125,7 @@ cleanup_wptr_test(struct spdk_ftl_dev *dev)
 {
 	size_t i;
 
-	for (i = 0; i < ftl_dev_num_bands(dev); ++i) {
+	for (i = 0; i < ftl_get_num_bands(dev); ++i) {
 		dev->bands[i].lba_map.segments = NULL;
 		test_free_ftl_band(&dev->bands[i]);
 	}
@@ -147,14 +141,14 @@ test_wptr(void)
 	struct ftl_band *band;
 	struct ftl_io io = { 0 };
 	size_t xfer_size;
-	size_t chunk, lbk, offset, i;
+	size_t zone, lbk, offset, i;
 	int rc;
 
-	setup_wptr_test(&dev, &g_geo, &g_range);
+	setup_wptr_test(&dev, &g_geo);
 
 	xfer_size = dev->xfer_size;
 	ftl_add_wptr(dev);
-	for (i = 0; i < ftl_dev_num_bands(dev); ++i) {
+	for (i = 0; i < ftl_get_num_bands(dev); ++i) {
 		wptr = LIST_FIRST(&dev->wptr_list);
 		band = wptr->band;
 		ftl_band_set_state(band, FTL_BAND_STATE_OPENING);
@@ -162,9 +156,9 @@ test_wptr(void)
 		io.band = band;
 		io.dev = dev;
 
-		for (lbk = 0, offset = 0; lbk < ftl_dev_lbks_in_chunk(dev) / xfer_size; ++lbk) {
-			for (chunk = 0; chunk < band->num_chunks; ++chunk) {
-				CU_ASSERT_EQUAL(wptr->ppa.lbk, (lbk * xfer_size));
+		for (lbk = 0, offset = 0; lbk < ftl_get_num_blocks_in_zone(dev) / xfer_size; ++lbk) {
+			for (zone = 0; zone < band->num_zones; ++zone) {
+				CU_ASSERT_EQUAL(wptr->addr.offset, (lbk * xfer_size));
 				CU_ASSERT_EQUAL(wptr->offset, offset);
 				ftl_wptr_advance(wptr, xfer_size);
 				offset += xfer_size;
@@ -172,7 +166,7 @@ test_wptr(void)
 		}
 
 		CU_ASSERT_EQUAL(band->state, FTL_BAND_STATE_FULL);
-		CU_ASSERT_EQUAL(wptr->ppa.lbk, ftl_dev_lbks_in_chunk(dev));
+		CU_ASSERT_EQUAL(wptr->addr.offset, ftl_get_num_blocks_in_zone(dev));
 
 		ftl_band_set_state(band, FTL_BAND_STATE_CLOSING);
 
@@ -186,7 +180,7 @@ test_wptr(void)
 
 		/* There are no free bands during the last iteration, so */
 		/* there'll be no new wptr allocation */
-		if (i == (ftl_dev_num_bands(dev) - 1)) {
+		if (i == (ftl_get_num_bands(dev) - 1)) {
 			CU_ASSERT_EQUAL(rc, -1);
 		} else {
 			CU_ASSERT_EQUAL(rc, 0);

@@ -496,7 +496,7 @@ spdk_nvmf_parse_subsystem(struct spdk_conf_section *sp)
 	spdk_nvmf_subsystem_set_allow_any_host(subsystem, allow_any_host);
 
 done:
-	return (subsystem != NULL);
+	return (subsystem != NULL) ? 0 : -1;
 }
 
 static int
@@ -638,6 +638,11 @@ spdk_nvmf_parse_transport(struct spdk_nvmf_parse_transport_ctx *ctx)
 	if (trtype == SPDK_NVME_TRANSPORT_TCP) {
 		bval = spdk_conf_section_get_boolval(ctx->sp, "C2HSuccess", true);
 		opts.c2h_success = bval;
+
+		val = spdk_conf_section_get_intval(ctx->sp, "SockPriority");
+		if (val >= 0) {
+			opts.sock_priority = val;
+		}
 	}
 
 	bval = spdk_conf_section_get_boolval(ctx->sp, "DifInsertOrStrip", false);

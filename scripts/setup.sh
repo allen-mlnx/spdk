@@ -159,15 +159,15 @@ function get_nvme_name_from_bdf {
 
 function get_virtio_names_from_bdf {
 	blk_devs=$(lsblk --nodeps --output NAME)
-	virtio_names=''
+	virtio_names=()
 
 	for dev in $blk_devs; do
 		if readlink "/sys/block/$dev" | grep -q "$1"; then
-			virtio_names="$virtio_names $dev"
+			virtio_names+=("$dev")
 		fi
 	done
 
-	eval "$2='$virtio_names'"
+	eval "$2=( " "${virtio_names[@]}" " )"
 }
 
 function configure_linux_pci {
@@ -653,8 +653,8 @@ function configure_freebsd_pci {
 		GREP_STR="${GREP_STR}\|chip=0x${dev_id}8086"
 	done < $TMP
 
-	AWK_PROG="{if (count > 0) printf \",\"; printf \"%s:%s:%s\",\$2,\$3,\$4; count++}"
-	echo $AWK_PROG > $TMP
+	AWK_PROG=("{if (count > 0) printf \",\"; printf \"%s:%s:%s\",\$2,\$3,\$4; count++}")
+	echo "${AWK_PROG[*]}" > $TMP
 
 	BDFS=$(pciconf -l | grep "${GREP_STR}" | awk -F: -f $TMP)
 

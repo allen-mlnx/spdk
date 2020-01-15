@@ -1,8 +1,8 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright (c) Intel Corporation.
- *   All rights reserved.
+ *   Copyright (c) Intel Corporation. All rights reserved.
+ *   Copyright (c) 2019 Mellanox Technologies LTD. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -34,6 +34,7 @@
 #include "spdk/stdinc.h"
 
 #include "bdev_nvme.h"
+#include "bdev_ocssd.h"
 
 #include "spdk/config.h"
 #include "spdk/conf.h"
@@ -50,19 +51,10 @@
 #include "spdk/bdev_module.h"
 #include "spdk_internal/log.h"
 
+#define SPDK_BDEV_NVME_DEFAULT_DELAY_CMD_SUBMIT true
+
 static void bdev_nvme_get_spdk_running_config(FILE *fp);
 static int bdev_nvme_config_json(struct spdk_json_write_ctx *w);
-
-struct nvme_io_channel {
-	struct spdk_nvme_qpair		*qpair;
-	struct spdk_poller		*poller;
-	TAILQ_HEAD(, spdk_bdev_io)	pending_resets;
-
-	bool				collect_spin_stat;
-	uint64_t			spin_ticks;
-	uint64_t			start_ticks;
-	uint64_t			end_ticks;
-};
 
 struct nvme_bdev_io {
 	/** array of iovecs to transfer. */
@@ -112,6 +104,7 @@ static struct spdk_bdev_nvme_opts g_opts = {
 	.nvme_adminq_poll_period_us = 1000000ULL,
 	.nvme_ioq_poll_period_us = 0,
 	.io_queue_requests = 0,
+	.delay_cmd_submit = SPDK_BDEV_NVME_DEFAULT_DELAY_CMD_SUBMIT,
 };
 
 #define NVME_HOTPLUG_POLL_PERIOD_MAX			10000000ULL
@@ -127,6 +120,7 @@ static char *g_nvme_hostnqn = NULL;
 
 static void nvme_ctrlr_populate_namespaces(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
 		struct nvme_async_probe_ctx *ctx);
+static void nvme_ctrlr_populate_namespaces_done(struct nvme_async_probe_ctx *ctx);
 static int bdev_nvme_library_init(void);
 static void bdev_nvme_library_fini(void);
 static int bdev_nvme_readv(struct nvme_bdev *nbdev, struct spdk_io_channel *ch,
@@ -138,6 +132,9 @@ static int bdev_nvme_no_pi_readv(struct nvme_bdev *nbdev, struct spdk_io_channel
 static int bdev_nvme_writev(struct nvme_bdev *nbdev, struct spdk_io_channel *ch,
 			    struct nvme_bdev_io *bio,
 			    struct iovec *iov, int iovcnt, void *md, uint64_t lba_count, uint64_t lba);
+static int bdev_nvme_comparev(struct nvme_bdev *nbdev, struct spdk_io_channel *ch,
+			      struct nvme_bdev_io *bio,
+			      struct iovec *iov, int iovcnt, void *md, uint64_t lba_count, uint64_t lba);
 static int bdev_nvme_admin_passthru(struct nvme_bdev *nbdev, struct spdk_io_channel *ch,
 				    struct nvme_bdev_io *bio,
 				    struct spdk_nvme_cmd *cmd, void *buf, size_t nbytes);
@@ -149,27 +146,34 @@ static int bdev_nvme_io_passthru_md(struct nvme_bdev *nbdev, struct spdk_io_chan
 				    struct spdk_nvme_cmd *cmd, void *buf, size_t nbytes, void *md_buf, size_t md_len);
 static int bdev_nvme_reset(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr, struct nvme_bdev_io *bio);
 
-typedef int (*populate_namespace_fn)(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
-				     struct nvme_bdev_ns *nvme_ns, struct nvme_async_probe_ctx *ctx);
-static int nvme_ctrlr_populate_standard_namespace(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
-		struct nvme_bdev_ns *nvme_ns, struct nvme_async_probe_ctx *ctx);
-static int nvme_ctrlr_populate_ocssd_namespace(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
+typedef void (*populate_namespace_fn)(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
+				      struct nvme_bdev_ns *nvme_ns, struct nvme_async_probe_ctx *ctx);
+static void nvme_ctrlr_populate_standard_namespace(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
 		struct nvme_bdev_ns *nvme_ns, struct nvme_async_probe_ctx *ctx);
 
 static populate_namespace_fn g_populate_namespace_fn[] = {
 	NULL,
 	nvme_ctrlr_populate_standard_namespace,
-	nvme_ctrlr_populate_ocssd_namespace,
+	bdev_ocssd_populate_namespace,
 };
 
 typedef void (*depopulate_namespace_fn)(struct nvme_bdev_ns *ns);
 static void nvme_ctrlr_depopulate_standard_namespace(struct nvme_bdev_ns *ns);
-static void nvme_ctrlr_depopulate_ocssd_namespace(struct nvme_bdev_ns *ns);
 
 static depopulate_namespace_fn g_depopulate_namespace_fn[] = {
 	NULL,
 	nvme_ctrlr_depopulate_standard_namespace,
-	nvme_ctrlr_depopulate_ocssd_namespace,
+	bdev_ocssd_depopulate_namespace,
+};
+
+typedef void (*config_json_namespace_fn)(struct spdk_json_write_ctx *w, struct nvme_bdev_ns *ns);
+static void nvme_ctrlr_config_json_standard_namespace(struct spdk_json_write_ctx *w,
+		struct nvme_bdev_ns *ns);
+
+static config_json_namespace_fn g_config_json_namespace_fn[] = {
+	NULL,
+	nvme_ctrlr_config_json_standard_namespace,
+	bdev_ocssd_namespace_config_json,
 };
 
 struct spdk_nvme_qpair *
@@ -338,7 +342,7 @@ _bdev_nvme_reset_create_qpair(struct spdk_io_channel_iter *i)
 	struct spdk_nvme_io_qpair_opts opts;
 
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(nvme_bdev_ctrlr->ctrlr, &opts, sizeof(opts));
-	opts.delay_pcie_doorbell = true;
+	opts.delay_cmd_submit = g_opts.delay_cmd_submit;
 
 	nvme_ch->qpair = spdk_nvme_ctrlr_alloc_io_qpair(nvme_bdev_ctrlr->ctrlr, &opts, sizeof(opts));
 	if (!nvme_ch->qpair) {
@@ -492,6 +496,16 @@ _bdev_nvme_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 					bdev_io->u.bdev.num_blocks,
 					bdev_io->u.bdev.offset_blocks);
 
+	case SPDK_BDEV_IO_TYPE_COMPARE:
+		return bdev_nvme_comparev(nbdev,
+					  ch,
+					  nbdev_io,
+					  bdev_io->u.bdev.iovs,
+					  bdev_io->u.bdev.iovcnt,
+					  bdev_io->u.bdev.md_buf,
+					  bdev_io->u.bdev.num_blocks,
+					  bdev_io->u.bdev.offset_blocks);
+
 	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
 		return bdev_nvme_unmap(nbdev,
 				       ch,
@@ -576,6 +590,9 @@ bdev_nvme_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	case SPDK_BDEV_IO_TYPE_NVME_IO:
 		return true;
 
+	case SPDK_BDEV_IO_TYPE_COMPARE:
+		return spdk_nvme_ns_supports_compare(nbdev->nvme_ns->ns);
+
 	case SPDK_BDEV_IO_TYPE_NVME_IO_MD:
 		return spdk_nvme_ns_get_md_size(nbdev->nvme_ns->ns) ? true : false;
 
@@ -620,7 +637,7 @@ bdev_nvme_create_cb(void *io_device, void *ctx_buf)
 #endif
 
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(nvme_bdev_ctrlr->ctrlr, &opts, sizeof(opts));
-	opts.delay_pcie_doorbell = true;
+	opts.delay_cmd_submit = g_opts.delay_cmd_submit;
 	opts.io_queue_requests = spdk_max(g_opts.io_queue_requests, opts.io_queue_requests);
 	g_opts.io_queue_requests = opts.io_queue_requests;
 
@@ -628,6 +645,13 @@ bdev_nvme_create_cb(void *io_device, void *ctx_buf)
 
 	if (ch->qpair == NULL) {
 		return -1;
+	}
+
+	if (spdk_nvme_ctrlr_is_ocssd_supported(nvme_bdev_ctrlr->ctrlr)) {
+		if (bdev_ocssd_create_io_channel(ch)) {
+			spdk_nvme_ctrlr_free_io_qpair(ch->qpair);
+			return -1;
+		}
 	}
 
 	ch->poller = spdk_poller_register(bdev_nvme_poll, ch, g_opts.nvme_ioq_poll_period_us);
@@ -639,7 +663,12 @@ bdev_nvme_create_cb(void *io_device, void *ctx_buf)
 static void
 bdev_nvme_destroy_cb(void *io_device, void *ctx_buf)
 {
+	struct nvme_bdev_ctrlr *nvme_bdev_ctrlr = io_device;
 	struct nvme_io_channel *ch = ctx_buf;
+
+	if (spdk_nvme_ctrlr_is_ocssd_supported(nvme_bdev_ctrlr->ctrlr)) {
+		bdev_ocssd_destroy_io_channel(ch);
+	}
 
 	spdk_nvme_ctrlr_free_io_qpair(ch->qpair);
 	spdk_poller_unregister(&ch->poller);
@@ -793,7 +822,7 @@ static const struct spdk_bdev_fn_table nvmelib_fn_table = {
 	.get_spin_time		= bdev_nvme_get_spin_time,
 };
 
-static int
+static void
 nvme_ctrlr_populate_standard_namespace(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
 				       struct nvme_bdev_ns *nvme_ns, struct nvme_async_probe_ctx *ctx)
 {
@@ -810,13 +839,15 @@ nvme_ctrlr_populate_standard_namespace(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
 	ns = spdk_nvme_ctrlr_get_ns(ctrlr, nvme_ns->id);
 	if (!ns) {
 		SPDK_DEBUGLOG(SPDK_LOG_BDEV_NVME, "Invalid NS %d\n", nvme_ns->id);
-		return -EINVAL;
+		nvme_ctrlr_populate_namespace_done(ctx, nvme_ns, -EINVAL);
+		return;
 	}
 
 	bdev = calloc(1, sizeof(*bdev));
 	if (!bdev) {
 		SPDK_ERRLOG("bdev calloc() failed\n");
-		return -ENOMEM;
+		nvme_ctrlr_populate_namespace_done(ctx, nvme_ns, -ENOMEM);
+		return;
 	}
 
 	bdev->nvme_bdev_ctrlr = nvme_bdev_ctrlr;
@@ -826,7 +857,8 @@ nvme_ctrlr_populate_standard_namespace(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
 	bdev->disk.name = spdk_sprintf_alloc("%sn%d", nvme_bdev_ctrlr->name, spdk_nvme_ns_get_id(ns));
 	if (!bdev->disk.name) {
 		free(bdev);
-		return -ENOMEM;
+		nvme_ctrlr_populate_namespace_done(ctx, nvme_ns, -ENOMEM);
+		return;
 	}
 	bdev->disk.product_name = "NVMe disk";
 
@@ -862,19 +894,12 @@ nvme_ctrlr_populate_standard_namespace(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
 	if (rc) {
 		free(bdev->disk.name);
 		free(bdev);
-		return rc;
+		nvme_ctrlr_populate_namespace_done(ctx, nvme_ns, rc);
+		return;
 	}
 
 	nvme_bdev_attach_bdev_to_ns(nvme_ns, bdev);
-
-	return 0;
-}
-
-static int
-nvme_ctrlr_populate_ocssd_namespace(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
-				    struct nvme_bdev_ns *nvme_ns, struct nvme_async_probe_ctx *ctx)
-{
-	return 0;
+	nvme_ctrlr_populate_namespace_done(ctx, nvme_ns, 0);
 }
 
 static bool
@@ -1014,20 +1039,33 @@ nvme_ctrlr_depopulate_standard_namespace(struct nvme_bdev_ns *ns)
 	ns->populated = false;
 }
 
-static void
-nvme_ctrlr_depopulate_ocssd_namespace(struct nvme_bdev_ns *ns)
-{
-}
-
-static int nvme_ctrlr_populate_namespace(struct nvme_bdev_ctrlr *ctrlr, struct nvme_bdev_ns *ns,
+static void nvme_ctrlr_populate_namespace(struct nvme_bdev_ctrlr *ctrlr, struct nvme_bdev_ns *ns,
 		struct nvme_async_probe_ctx *ctx)
 {
-	return g_populate_namespace_fn[ns->type](ctrlr, ns, ctx);
+	g_populate_namespace_fn[ns->type](ctrlr, ns, ctx);
 }
 
 static void nvme_ctrlr_depopulate_namespace(struct nvme_bdev_ctrlr *ctrlr, struct nvme_bdev_ns *ns)
 {
 	g_depopulate_namespace_fn[ns->type](ns);
+}
+
+void
+nvme_ctrlr_populate_namespace_done(struct nvme_async_probe_ctx *ctx,
+				   struct nvme_bdev_ns *ns, int rc)
+{
+	if (rc == 0) {
+		ns->populated = true;
+	} else {
+		memset(ns, 0, sizeof(*ns));
+	}
+
+	if (ctx) {
+		ctx->populates_in_progress--;
+		if (ctx->populates_in_progress == 0) {
+			nvme_ctrlr_populate_namespaces_done(ctx);
+		}
+	}
 }
 
 static void
@@ -1037,7 +1075,13 @@ nvme_ctrlr_populate_namespaces(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
 	struct spdk_nvme_ctrlr	*ctrlr = nvme_bdev_ctrlr->ctrlr;
 	struct nvme_bdev_ns	*ns;
 	uint32_t		i;
-	int			rc;
+
+	if (ctx) {
+		/* Initialize this count to 1 to handle the populate functions
+		 * calling nvme_ctrlr_populate_namespace_done() immediately.
+		 */
+		ctx->populates_in_progress = 1;
+	}
 
 	for (i = 0; i < nvme_bdev_ctrlr->num_ns; i++) {
 		uint32_t	nsid = i + 1;
@@ -1054,16 +1098,26 @@ nvme_ctrlr_populate_namespaces(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr,
 
 			TAILQ_INIT(&ns->bdevs);
 
-			rc = nvme_ctrlr_populate_namespace(nvme_bdev_ctrlr, ns, ctx);
-			if (rc == 0) {
-				ns->populated = true;
-			} else {
-				memset(ns, 0, sizeof(*ns));
+			if (ctx) {
+				ctx->populates_in_progress++;
 			}
+			nvme_ctrlr_populate_namespace(nvme_bdev_ctrlr, ns, ctx);
 		}
 
 		if (ns->populated && !spdk_nvme_ctrlr_is_active_ns(ctrlr, nsid)) {
 			nvme_ctrlr_depopulate_namespace(nvme_bdev_ctrlr, ns);
+		}
+	}
+
+	if (ctx) {
+		/* Decrement this count now that the loop is over to account
+		 * for the one we started with.  If the count is then 0, we
+		 * know any populate_namespace functions completed immediately,
+		 * so we'll kick the callback here.
+		 */
+		ctx->populates_in_progress--;
+		if (ctx->populates_in_progress == 0) {
+			nvme_ctrlr_populate_namespaces_done(ctx);
 		}
 	}
 
@@ -1084,6 +1138,10 @@ aer_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 	if ((event.bits.async_event_type == SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE) &&
 	    (event.bits.async_event_info == SPDK_NVME_ASYNC_EVENT_NS_ATTR_CHANGED)) {
 		nvme_ctrlr_populate_namespaces(nvme_bdev_ctrlr, NULL);
+	} else if ((event.bits.async_event_type == SPDK_NVME_ASYNC_EVENT_TYPE_VENDOR) &&
+		   (event.bits.log_page_identifier == SPDK_OCSSD_LOG_CHUNK_NOTIFICATION) &&
+		   spdk_nvme_ctrlr_is_ocssd_supported(nvme_bdev_ctrlr->ctrlr)) {
+		bdev_ocssd_handle_chunk_notification(nvme_bdev_ctrlr);
 	}
 }
 
@@ -1095,6 +1153,7 @@ create_ctrlr(struct spdk_nvme_ctrlr *ctrlr,
 {
 	struct nvme_bdev_ctrlr *nvme_bdev_ctrlr;
 	uint32_t i;
+	int rc;
 
 	nvme_bdev_ctrlr = calloc(1, sizeof(*nvme_bdev_ctrlr));
 	if (nvme_bdev_ctrlr == NULL) {
@@ -1132,6 +1191,18 @@ create_ctrlr(struct spdk_nvme_ctrlr *ctrlr,
 		free(nvme_bdev_ctrlr);
 		return -ENOMEM;
 	}
+
+	if (spdk_nvme_ctrlr_is_ocssd_supported(nvme_bdev_ctrlr->ctrlr)) {
+		rc = bdev_ocssd_init_ctrlr(nvme_bdev_ctrlr);
+		if (spdk_unlikely(rc != 0)) {
+			SPDK_ERRLOG("Unable to initialize OCSSD controller\n");
+			free(nvme_bdev_ctrlr->name);
+			free(nvme_bdev_ctrlr->namespaces);
+			free(nvme_bdev_ctrlr);
+			return rc;
+		}
+	}
+
 	nvme_bdev_ctrlr->prchk_flags = prchk_flags;
 
 	spdk_io_device_register(nvme_bdev_ctrlr, bdev_nvme_create_cb, bdev_nvme_destroy_cb,
@@ -1280,7 +1351,9 @@ int
 spdk_bdev_nvme_set_opts(const struct spdk_bdev_nvme_opts *opts)
 {
 	if (g_bdev_nvme_init_thread != NULL) {
-		return -EPERM;
+		if (!TAILQ_EMPTY(&g_nvme_bdev_ctrlrs)) {
+			return -EPERM;
+		}
 	}
 
 	g_opts = *opts;
@@ -1388,22 +1461,11 @@ nvme_ctrlr_populate_namespaces_done(struct nvme_async_probe_ctx *ctx)
 }
 
 static void
-bdev_nvme_populate_namespaces(struct nvme_async_probe_ctx *ctx)
-{
-	struct nvme_bdev_ctrlr	*nvme_bdev_ctrlr;
-
-	nvme_bdev_ctrlr = nvme_bdev_ctrlr_get(&ctx->trid);
-	assert(nvme_bdev_ctrlr != NULL);
-
-	nvme_ctrlr_populate_namespaces(nvme_bdev_ctrlr, ctx);
-	nvme_ctrlr_populate_namespaces_done(ctx);
-}
-
-static void
 connect_attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 		  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
 {
 	struct spdk_nvme_ctrlr_opts *user_opts = cb_ctx;
+	struct nvme_bdev_ctrlr	*nvme_bdev_ctrlr;
 	struct nvme_async_probe_ctx *ctx;
 	int rc;
 
@@ -1418,7 +1480,10 @@ connect_attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 		return;
 	}
 
-	bdev_nvme_populate_namespaces(ctx);
+	nvme_bdev_ctrlr = nvme_bdev_ctrlr_get(&ctx->trid);
+	assert(nvme_bdev_ctrlr != NULL);
+
+	nvme_ctrlr_populate_namespaces(nvme_bdev_ctrlr, ctx);
 }
 
 static int
@@ -1611,6 +1676,9 @@ bdev_nvme_library_init(void)
 	g_nvme_hostnqn = spdk_conf_section_get_val(sp, "HostNQN");
 	probe_ctx->hostnqn = g_nvme_hostnqn;
 
+	g_opts.delay_cmd_submit = spdk_conf_section_get_boolval(sp, "DelayCmdSubmit",
+				  SPDK_BDEV_NVME_DEFAULT_DELAY_CMD_SUBMIT);
+
 	for (i = 0; i < NVME_MAX_CONTROLLERS; i++) {
 		val = spdk_conf_section_get_nmval(sp, "TransportID", i, 0);
 		if (val == NULL) {
@@ -1744,6 +1812,8 @@ bdev_nvme_library_fini(void)
 {
 	struct nvme_bdev_ctrlr *nvme_bdev_ctrlr, *tmp;
 	struct nvme_probe_skip_entry *entry, *entry_tmp;
+	struct nvme_bdev_ns *ns;
+	uint32_t i;
 
 	spdk_poller_unregister(&g_hotplug_poller);
 	free(g_hotplug_probe_ctx);
@@ -1770,6 +1840,17 @@ bdev_nvme_library_fini(void)
 
 		nvme_bdev_ctrlr->destruct = true;
 		pthread_mutex_unlock(&g_bdev_nvme_mutex);
+
+		for (i = 0; i < nvme_bdev_ctrlr->num_ns; i++) {
+			uint32_t nsid = i + 1;
+
+			ns = nvme_bdev_ctrlr->namespaces[nsid - 1];
+			if (ns->populated) {
+				assert(ns->id == nsid);
+				nvme_ctrlr_depopulate_namespace(nvme_bdev_ctrlr, ns);
+			}
+		}
+
 		nvme_bdev_ctrlr_destruct(nvme_bdev_ctrlr);
 		pthread_mutex_lock(&g_bdev_nvme_mutex);
 	}
@@ -1870,6 +1951,21 @@ bdev_nvme_writev_done(void *ref, const struct spdk_nvme_cpl *cpl)
 		SPDK_ERRLOG("writev completed with PI error (sct=%d, sc=%d)\n",
 			    cpl->status.sct, cpl->status.sc);
 		/* Run PI verification for write data buffer if PI error is detected. */
+		bdev_nvme_verify_pi_error(bdev_io);
+	}
+
+	spdk_bdev_io_complete_nvme_status(bdev_io, cpl->cdw0, cpl->status.sct, cpl->status.sc);
+}
+
+static void
+bdev_nvme_comparev_done(void *ref, const struct spdk_nvme_cpl *cpl)
+{
+	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx((struct nvme_bdev_io *)ref);
+
+	if (spdk_nvme_cpl_is_pi_error(cpl)) {
+		SPDK_ERRLOG("comparev completed with PI error (sct=%d, sc=%d)\n",
+			    cpl->status.sct, cpl->status.sc);
+		/* Run PI verification for compare data buffer if PI error is detected. */
 		bdev_nvme_verify_pi_error(bdev_io);
 	}
 
@@ -2025,6 +2121,33 @@ bdev_nvme_writev(struct nvme_bdev *nbdev, struct spdk_io_channel *ch,
 
 	if (rc != 0 && rc != -ENOMEM) {
 		SPDK_ERRLOG("writev failed: rc = %d\n", rc);
+	}
+	return rc;
+}
+
+static int
+bdev_nvme_comparev(struct nvme_bdev *nbdev, struct spdk_io_channel *ch,
+		   struct nvme_bdev_io *bio,
+		   struct iovec *iov, int iovcnt, void *md, uint64_t lba_count, uint64_t lba)
+{
+	struct nvme_io_channel *nvme_ch = spdk_io_channel_get_ctx(ch);
+	int rc;
+
+	SPDK_DEBUGLOG(SPDK_LOG_BDEV_NVME, "compare %lu blocks with offset %#lx\n",
+		      lba_count, lba);
+
+	bio->iovs = iov;
+	bio->iovcnt = iovcnt;
+	bio->iovpos = 0;
+	bio->iov_offset = 0;
+
+	rc = spdk_nvme_ns_cmd_comparev_with_md(nbdev->nvme_ns->ns, nvme_ch->qpair, lba, lba_count,
+					       bdev_nvme_comparev_done, bio, nbdev->disk.dif_check_flags,
+					       bdev_nvme_queued_reset_sgl, bdev_nvme_queued_next_sge,
+					       md, 0, 0);
+
+	if (rc != 0 && rc != -ENOMEM) {
+		SPDK_ERRLOG("comparev failed: rc = %d\n", rc);
 	}
 	return rc;
 }
@@ -2245,8 +2368,21 @@ bdev_nvme_get_spdk_running_config(FILE *fp)
 	if (g_nvme_hostnqn) {
 		fprintf(fp, "HostNQN %s\n",  g_nvme_hostnqn);
 	}
+	fprintf(fp, "DelayCmdSubmit %s\n", g_opts.delay_cmd_submit ? "True" : "False");
 
 	fprintf(fp, "\n");
+}
+
+static void
+nvme_ctrlr_config_json_standard_namespace(struct spdk_json_write_ctx *w, struct nvme_bdev_ns *ns)
+{
+	/* nop */
+}
+
+static void
+nvme_namespace_config_json(struct spdk_json_write_ctx *w, struct nvme_bdev_ns *ns)
+{
+	g_config_json_namespace_fn[ns->type](w, ns);
 }
 
 static int
@@ -2255,6 +2391,7 @@ bdev_nvme_config_json(struct spdk_json_write_ctx *w)
 	struct nvme_bdev_ctrlr		*nvme_bdev_ctrlr;
 	struct spdk_nvme_transport_id	*trid;
 	const char			*action;
+	uint32_t			nsid;
 
 	if (g_opts.action_on_timeout == SPDK_BDEV_NVME_TIMEOUT_ACTION_RESET) {
 		action = "reset";
@@ -2279,14 +2416,14 @@ bdev_nvme_config_json(struct spdk_json_write_ctx *w)
 	spdk_json_write_named_uint64(w, "nvme_adminq_poll_period_us", g_opts.nvme_adminq_poll_period_us);
 	spdk_json_write_named_uint64(w, "nvme_ioq_poll_period_us", g_opts.nvme_ioq_poll_period_us);
 	spdk_json_write_named_uint32(w, "io_queue_requests", g_opts.io_queue_requests);
+	spdk_json_write_named_bool(w, "delay_cmd_submit", g_opts.delay_cmd_submit);
 	spdk_json_write_object_end(w);
 
 	spdk_json_write_object_end(w);
 
 	pthread_mutex_lock(&g_bdev_nvme_mutex);
 	TAILQ_FOREACH(nvme_bdev_ctrlr, &g_nvme_bdev_ctrlrs, tailq) {
-
-		if (spdk_nvme_ctrlr_is_ocssd_supported(nvme_bdev_ctrlr->ctrlr)) {
+		if (nvme_bdev_ctrlr->ftl_managed) {
 			continue;
 		}
 
@@ -2307,6 +2444,14 @@ bdev_nvme_config_json(struct spdk_json_write_ctx *w)
 		spdk_json_write_object_end(w);
 
 		spdk_json_write_object_end(w);
+
+		for (nsid = 0; nsid < nvme_bdev_ctrlr->num_ns; ++nsid) {
+			if (!nvme_bdev_ctrlr->namespaces[nsid]->populated) {
+				continue;
+			}
+
+			nvme_namespace_config_json(w, nvme_bdev_ctrlr->namespaces[nsid]);
+		}
 	}
 
 	/* Dump as last parameter to give all NVMe bdevs chance to be constructed

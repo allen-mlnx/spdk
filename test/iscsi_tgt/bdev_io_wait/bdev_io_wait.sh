@@ -7,8 +7,6 @@ source $rootdir/test/iscsi_tgt/common.sh
 
 iscsitestinit $1 $2
 
-timing_enter bdev_io_wait
-
 MALLOC_BDEV_SIZE=64
 MALLOC_BLOCK_SIZE=512
 
@@ -54,5 +52,3 @@ trap - SIGINT SIGTERM EXIT
 killprocess $pid
 
 iscsitestfini $1 $2
-report_test_completion "bdev_io_wait"
-timing_exit bdev_io_wait

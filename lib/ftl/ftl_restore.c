@@ -137,7 +137,7 @@ struct ftl_restore {
 static int
 ftl_restore_tail_md(struct ftl_restore_band *rband);
 static void
-ftl_pad_chunk_cb(struct ftl_io *io, void *arg, int status);
+ftl_pad_zone_cb(struct ftl_io *io, void *arg, int status);
 static void
 ftl_restore_pad_band(struct ftl_restore_band *rband);
 
@@ -175,14 +175,14 @@ ftl_restore_init(struct spdk_ftl_dev *dev, ftl_restore_fn cb)
 	restore->cb = cb;
 	restore->final_phase = false;
 
-	restore->bands = calloc(ftl_dev_num_bands(dev), sizeof(*restore->bands));
+	restore->bands = calloc(ftl_get_num_bands(dev), sizeof(*restore->bands));
 	if (!restore->bands) {
 		goto error;
 	}
 
 	STAILQ_INIT(&restore->pad_bands);
 
-	for (i = 0; i < ftl_dev_num_bands(dev); ++i) {
+	for (i = 0; i < ftl_get_num_bands(dev); ++i) {
 		rband = &restore->bands[i];
 		rband->band = &dev->bands[i];
 		rband->parent = restore;
@@ -190,7 +190,7 @@ ftl_restore_init(struct spdk_ftl_dev *dev, ftl_restore_fn cb)
 	}
 
 	/* Allocate buffer capable of holding head mds of all bands */
-	restore->md_buf = spdk_dma_zmalloc(ftl_dev_num_bands(dev) * ftl_head_md_num_lbks(dev) *
+	restore->md_buf = spdk_dma_zmalloc(ftl_get_num_bands(dev) * ftl_head_md_num_lbks(dev) *
 					   FTL_BLOCK_SIZE, 0, NULL);
 	if (!restore->md_buf) {
 		goto error;
@@ -235,7 +235,7 @@ ftl_restore_check_seq(const struct ftl_restore *restore)
 	const struct ftl_band *next_band;
 	size_t i;
 
-	for (i = 0; i < ftl_dev_num_bands(dev); ++i) {
+	for (i = 0; i < ftl_get_num_bands(dev); ++i) {
 		rband = &restore->bands[i];
 		if (rband->md_status != FTL_MD_SUCCESS) {
 			continue;
@@ -256,7 +256,7 @@ ftl_restore_head_valid(struct spdk_ftl_dev *dev, struct ftl_restore *restore, si
 	struct ftl_restore_band *rband;
 	size_t i;
 
-	for (i = 0; i < ftl_dev_num_bands(dev); ++i) {
+	for (i = 0; i < ftl_get_num_bands(dev); ++i) {
 		rband = &restore->bands[i];
 
 		if (rband->md_status != FTL_MD_SUCCESS &&
@@ -292,7 +292,7 @@ ftl_restore_head_complete(struct ftl_restore *restore)
 	}
 
 	/* Sort bands in sequence number ascending order */
-	qsort(restore->bands, ftl_dev_num_bands(dev), sizeof(struct ftl_restore_band),
+	qsort(restore->bands, ftl_get_num_bands(dev), sizeof(struct ftl_restore_band),
 	      ftl_band_cmp);
 
 	if (ftl_restore_check_seq(restore)) {
@@ -332,16 +332,16 @@ ftl_restore_head_md(void *ctx)
 	unsigned int num_failed = 0, num_ios;
 	size_t i;
 
-	restore->num_ios = ftl_dev_num_bands(dev);
+	restore->num_ios = ftl_get_num_bands(dev);
 
-	for (i = 0; i < ftl_dev_num_bands(dev); ++i) {
+	for (i = 0; i < ftl_get_num_bands(dev); ++i) {
 		rband = &restore->bands[i];
 		lba_map = &rband->band->lba_map;
 
 		lba_map->dma_buf = restore->md_buf + i * ftl_head_md_num_lbks(dev) * FTL_BLOCK_SIZE;
 
 		if (ftl_band_read_head_md(rband->band, ftl_restore_head_cb, rband)) {
-			if (spdk_likely(rband->band->num_chunks)) {
+			if (spdk_likely(rband->band->num_zones)) {
 				SPDK_ERRLOG("Failed to read metadata on band %zu\n", i);
 
 				rband->md_status = FTL_MD_INVALID_CRC;
@@ -383,11 +383,11 @@ static int
 ftl_restore_l2p(struct ftl_band *band)
 {
 	struct spdk_ftl_dev *dev = band->dev;
-	struct ftl_ppa ppa;
+	struct ftl_addr addr;
 	uint64_t lba;
 	size_t i;
 
-	for (i = 0; i < ftl_num_band_lbks(band->dev); ++i) {
+	for (i = 0; i < ftl_get_num_blocks_in_band(band->dev); ++i) {
 		if (!spdk_bit_array_get(band->lba_map.vld, i)) {
 			continue;
 		}
@@ -397,15 +397,15 @@ ftl_restore_l2p(struct ftl_band *band)
 			return -1;
 		}
 
-		ppa = ftl_l2p_get(dev, lba);
-		if (!ftl_ppa_invalid(ppa)) {
-			ftl_invalidate_addr(dev, ppa);
+		addr = ftl_l2p_get(dev, lba);
+		if (!ftl_addr_invalid(addr)) {
+			ftl_invalidate_addr(dev, addr);
 		}
 
-		ppa = ftl_band_ppa_from_lbkoff(band, i);
+		addr = ftl_band_addr_from_lbkoff(band, i);
 
-		ftl_band_set_addr(band, lba, ppa);
-		ftl_l2p_set(dev, lba, ppa);
+		ftl_band_set_addr(band, lba, addr);
+		ftl_l2p_set(dev, lba, addr);
 	}
 
 	return 0;
@@ -416,10 +416,10 @@ ftl_restore_next_band(struct ftl_restore *restore)
 {
 	struct ftl_restore_band *rband;
 
-	for (; restore->current < ftl_dev_num_bands(restore->dev); ++restore->current) {
+	for (; restore->current < ftl_get_num_bands(restore->dev); ++restore->current) {
 		rband = &restore->bands[restore->current];
 
-		if (spdk_likely(rband->band->num_chunks) &&
+		if (spdk_likely(rband->band->num_zones) &&
 		    rband->md_status == FTL_MD_SUCCESS) {
 			restore->current++;
 			return rband;
@@ -1068,11 +1068,11 @@ ftl_restore_nv_cache(struct ftl_restore *restore, ftl_restore_fn cb)
 }
 
 static bool
-ftl_pad_chunk_pad_finish(struct ftl_restore_band *rband, bool direct_access)
+ftl_pad_zone_pad_finish(struct ftl_restore_band *rband, bool direct_access)
 {
 	struct ftl_restore *restore = rband->parent;
 	struct ftl_restore_band *next_band;
-	size_t i, num_pad_chunks = 0;
+	size_t i, num_pad_zones = 0;
 
 	if (spdk_unlikely(restore->pad_status && !restore->num_ios)) {
 		if (direct_access) {
@@ -1086,14 +1086,14 @@ ftl_pad_chunk_pad_finish(struct ftl_restore_band *rband, bool direct_access)
 		return true;
 	}
 
-	for (i = 0; i < rband->band->num_chunks; ++i) {
-		if (rband->band->chunk_buf[i].state != FTL_CHUNK_STATE_CLOSED) {
-			num_pad_chunks++;
+	for (i = 0; i < rband->band->num_zones; ++i) {
+		if (rband->band->zone_buf[i].state != SPDK_BDEV_ZONE_STATE_CLOSED) {
+			num_pad_zones++;
 		}
 	}
 
-	/* Finished all chunks in a band, check if all bands are done */
-	if (num_pad_chunks == 0) {
+	/* Finished all zones in a band, check if all bands are done */
+	if (num_pad_zones == 0) {
 		if (direct_access) {
 			rband->band->state = FTL_BAND_STATE_CLOSED;
 			ftl_band_set_direct_access(rband->band, false);
@@ -1115,11 +1115,11 @@ ftl_pad_chunk_pad_finish(struct ftl_restore_band *rband, bool direct_access)
 
 static struct ftl_io *
 ftl_restore_init_pad_io(struct ftl_restore_band *rband, void *buffer,
-			struct ftl_ppa ppa)
+			struct ftl_addr addr)
 {
 	struct ftl_band *band = rband->band;
 	struct spdk_ftl_dev *dev = band->dev;
-	int flags = FTL_IO_PAD | FTL_IO_INTERNAL | FTL_IO_PPA_MODE | FTL_IO_MD |
+	int flags = FTL_IO_PAD | FTL_IO_INTERNAL | FTL_IO_PHYSICAL_MODE | FTL_IO_MD |
 		    FTL_IO_DIRECT_ACCESS;
 	struct ftl_io_init_opts opts = {
 		.dev		= dev,
@@ -1130,7 +1130,7 @@ ftl_restore_init_pad_io(struct ftl_restore_band *rband, void *buffer,
 		.flags		= flags,
 		.type		= FTL_IO_WRITE,
 		.lbk_cnt	= dev->xfer_size,
-		.cb_fn		= ftl_pad_chunk_cb,
+		.cb_fn		= ftl_pad_zone_cb,
 		.cb_ctx		= rband,
 		.data		= buffer,
 		.parent		= NULL,
@@ -1142,19 +1142,19 @@ ftl_restore_init_pad_io(struct ftl_restore_band *rband, void *buffer,
 		return NULL;
 	}
 
-	io->ppa = ppa;
+	io->addr = addr;
 	rband->parent->num_ios++;
 
 	return io;
 }
 
 static void
-ftl_pad_chunk_cb(struct ftl_io *io, void *arg, int status)
+ftl_pad_zone_cb(struct ftl_io *io, void *arg, int status)
 {
 	struct ftl_restore_band *rband = arg;
 	struct ftl_restore *restore = rband->parent;
 	struct ftl_band *band = io->band;
-	struct ftl_chunk *chunk;
+	struct ftl_zone *zone;
 	struct ftl_io *new_io;
 
 	restore->num_ios--;
@@ -1164,13 +1164,13 @@ ftl_pad_chunk_cb(struct ftl_io *io, void *arg, int status)
 		goto end;
 	}
 
-	if (io->ppa.lbk + io->lbk_cnt == band->dev->geo.clba) {
-		chunk = ftl_band_chunk_from_ppa(band, io->ppa);
-		chunk->state = FTL_CHUNK_STATE_CLOSED;
+	if (io->addr.offset + io->lbk_cnt == band->dev->geo.clba) {
+		zone = ftl_band_zone_from_addr(band, io->addr);
+		zone->state = SPDK_BDEV_ZONE_STATE_CLOSED;
 	} else {
-		struct ftl_ppa ppa = io->ppa;
-		ppa.lbk += io->lbk_cnt;
-		new_io = ftl_restore_init_pad_io(rband, io->iov[0].iov_base, ppa);
+		struct ftl_addr addr = io->addr;
+		addr.offset += io->lbk_cnt;
+		new_io = ftl_restore_init_pad_io(rband, io->iov[0].iov_base, addr);
 		if (spdk_unlikely(!new_io)) {
 			restore->pad_status = -ENOMEM;
 			goto end;
@@ -1182,7 +1182,7 @@ ftl_pad_chunk_cb(struct ftl_io *io, void *arg, int status)
 
 end:
 	spdk_dma_free(io->iov[0].iov_base);
-	ftl_pad_chunk_pad_finish(rband, true);
+	ftl_pad_zone_pad_finish(rband, true);
 }
 
 static void
@@ -1194,12 +1194,12 @@ ftl_restore_pad_band(struct ftl_restore_band *rband)
 	struct spdk_ftl_dev *dev = band->dev;
 	void *buffer = NULL;
 	struct ftl_io *io;
-	struct ftl_ppa ppa;
+	struct ftl_addr addr;
 	size_t i;
 	int rc = 0;
 
-	/* Check if some chunks are not closed */
-	if (ftl_pad_chunk_pad_finish(rband, false)) {
+	/* Check if some zones are not closed */
+	if (ftl_pad_zone_pad_finish(rband, false)) {
 		/*
 		 * If we're here, end meta wasn't recognized, but the whole band is written
 		 * Assume the band was padded and ignore it
@@ -1214,17 +1214,17 @@ ftl_restore_pad_band(struct ftl_restore_band *rband)
 		return;
 	}
 
-	for (i = 0; i < band->num_chunks; ++i) {
-		if (band->chunk_buf[i].state == FTL_CHUNK_STATE_CLOSED) {
+	for (i = 0; i < band->num_zones; ++i) {
+		if (band->zone_buf[i].state == SPDK_BDEV_ZONE_STATE_CLOSED) {
 			continue;
 		}
 
-		rc = ftl_retrieve_chunk_info(dev, band->chunk_buf[i].start_ppa, &info, 1);
+		rc = ftl_retrieve_chunk_info(dev, band->zone_buf[i].start_addr, &info, 1);
 		if (spdk_unlikely(rc)) {
 			goto error;
 		}
-		ppa = band->chunk_buf[i].start_ppa;
-		ppa.lbk = info.wp;
+		addr = band->zone_buf[i].start_addr;
+		addr.offset = info.wp;
 
 		buffer = spdk_dma_zmalloc(FTL_BLOCK_SIZE * dev->xfer_size, 0, NULL);
 		if (spdk_unlikely(!buffer)) {
@@ -1232,7 +1232,7 @@ ftl_restore_pad_band(struct ftl_restore_band *rband)
 			goto error;
 		}
 
-		io = ftl_restore_init_pad_io(rband, buffer, ppa);
+		io = ftl_restore_init_pad_io(rband, buffer, addr);
 		if (spdk_unlikely(!io)) {
 			rc = -ENOMEM;
 			spdk_dma_free(buffer);
@@ -1246,7 +1246,7 @@ ftl_restore_pad_band(struct ftl_restore_band *rband)
 
 error:
 	restore->pad_status = rc;
-	ftl_pad_chunk_pad_finish(rband, true);
+	ftl_pad_zone_pad_finish(rband, true);
 }
 
 static void
@@ -1312,7 +1312,7 @@ ftl_restore_tail_md(struct ftl_restore_band *rband)
 		return -ENOMEM;
 	}
 
-	if (ftl_band_read_tail_md(band, band->tail_md_ppa, ftl_restore_tail_md_cb, rband)) {
+	if (ftl_band_read_tail_md(band, band->tail_md_addr, ftl_restore_tail_md_cb, rband)) {
 		SPDK_ERRLOG("Failed to send tail metadata read\n");
 		ftl_restore_complete(restore, -EIO);
 		return -EIO;

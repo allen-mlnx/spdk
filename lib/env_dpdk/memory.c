@@ -36,6 +36,7 @@
 #include "env_internal.h"
 
 #include <rte_config.h>
+#include <rte_malloc.h>
 #include <rte_memory.h>
 #include <rte_eal_memconfig.h>
 
@@ -145,6 +146,8 @@ struct spdk_mem_map {
 static struct spdk_mem_map *g_mem_reg_map;
 static TAILQ_HEAD(, spdk_mem_map) g_spdk_mem_maps = TAILQ_HEAD_INITIALIZER(g_spdk_mem_maps);
 static pthread_mutex_t g_spdk_mem_map_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static bool g_legacy_mem;
 
 /*
  * Walk the currently registered memory via the main memory registration map
@@ -340,7 +343,11 @@ spdk_mem_map_free(struct spdk_mem_map **pmap)
 	}
 
 	for (i = 0; i < sizeof(map->map_256tb.map) / sizeof(map->map_256tb.map[0]); i++) {
-		free(map->map_256tb.map[i]);
+		if (g_legacy_mem) {
+			rte_free(map->map_256tb.map[i]);
+		} else {
+			free(map->map_256tb.map[i]);
+		}
 	}
 
 	pthread_mutex_destroy(&map->mutex);
@@ -520,7 +527,23 @@ spdk_mem_map_get_map_1gb(struct spdk_mem_map *map, uint64_t vfn_2mb)
 		/* Recheck to make sure nobody else got the mutex first. */
 		map_1gb = map->map_256tb.map[idx_256tb];
 		if (!map_1gb) {
-			map_1gb = malloc(sizeof(struct map_1gb));
+			/* Some of the existing apps use TCMalloc hugepage
+			 * allocator and register this tcmalloc allocated
+			 * hugepage memory with SPDK in the mmap hook. Since
+			 * this function is called in the spdk_mem_register
+			 * code path we can't do a malloc here otherwise that
+			 * would cause a livelock. So we use the dpdk provided
+			 * allocator instead, which avoids this cyclic
+			 * dependency.  Note this is only guaranteed to work when
+			 * DPDK dynamic memory allocation is disabled (--legacy-mem),
+			 * which then is a requirement for anyone using TCMalloc in
+			 * this way.
+			 */
+			if (g_legacy_mem) {
+				map_1gb = rte_malloc(NULL, sizeof(struct map_1gb), 0);
+			} else {
+				map_1gb = malloc(sizeof(struct map_1gb));
+			}
 			if (map_1gb) {
 				/* initialize all entries to default translation */
 				for (i = 0; i < SPDK_COUNTOF(map_1gb->map); i++) {
@@ -585,41 +608,7 @@ spdk_mem_map_set_translation(struct spdk_mem_map *map, uint64_t vaddr, uint64_t 
 int
 spdk_mem_map_clear_translation(struct spdk_mem_map *map, uint64_t vaddr, uint64_t size)
 {
-	uint64_t vfn_2mb;
-	struct map_1gb *map_1gb;
-	uint64_t idx_1gb;
-	struct map_2mb *map_2mb;
-
-	if ((uintptr_t)vaddr & ~MASK_256TB) {
-		DEBUG_PRINT("invalid usermode virtual address %lu\n", vaddr);
-		return -EINVAL;
-	}
-
-	/* For now, only 2 MB-aligned registrations are supported */
-	if (((uintptr_t)vaddr & MASK_2MB) || (size & MASK_2MB)) {
-		DEBUG_PRINT("invalid %s parameters, vaddr=%lu len=%ju\n",
-			    __func__, vaddr, size);
-		return -EINVAL;
-	}
-
-	vfn_2mb = vaddr >> SHIFT_2MB;
-
-	while (size) {
-		map_1gb = spdk_mem_map_get_map_1gb(map, vfn_2mb);
-		if (!map_1gb) {
-			DEBUG_PRINT("could not get %p map\n", (void *)vaddr);
-			return -ENOMEM;
-		}
-
-		idx_1gb = MAP_1GB_IDX(vfn_2mb);
-		map_2mb = &map_1gb->map[idx_1gb];
-		map_2mb->translation_2mb = map->default_translation;
-
-		size -= VALUE_2MB;
-		vfn_2mb++;
-	}
-
-	return 0;
+	return spdk_mem_map_set_translation(map, vaddr, size, map->default_translation);
 }
 
 inline uint64_t
@@ -734,8 +723,10 @@ memory_iter_cb(const struct rte_memseg_list *msl,
 #endif
 
 int
-spdk_mem_map_init(void)
+spdk_mem_map_init(bool legacy_mem)
 {
+	g_legacy_mem = legacy_mem;
+
 	g_mem_reg_map = spdk_mem_map_alloc(0, NULL, NULL);
 	if (g_mem_reg_map == NULL) {
 		DEBUG_PRINT("memory registration map allocation failed\n");
@@ -1013,13 +1004,16 @@ spdk_vtophys_notify(void *cb_ctx, struct spdk_mem_map *map,
 		if (paddr == SPDK_VTOPHYS_ERROR) {
 			/* This is not an address that DPDK is managing. */
 #if SPDK_VFIO_ENABLED
-			if (spdk_iommu_is_enabled()) {
-				/* We'll use the virtual address as the iova. DPDK
-				 * currently uses physical addresses as the iovas (or counts
-				 * up from 0 if it can't get physical addresses), so
-				 * the range of user space virtual addresses and physical
-				 * addresses will never overlap.
-				 */
+			enum rte_iova_mode iova_mode;
+
+#if RTE_VERSION >= RTE_VERSION_NUM(19, 11, 0, 0)
+			iova_mode = rte_eal_iova_mode();
+#else
+			iova_mode = rte_eal_get_configuration()->iova_mode;
+#endif
+
+			if (spdk_iommu_is_enabled() && iova_mode == RTE_IOVA_VA) {
+				/* We'll use the virtual address as the iova to match DPDK. */
 				paddr = (uint64_t)vaddr;
 				rc = vtophys_iommu_map_dma((uint64_t)vaddr, paddr, len);
 				if (rc) {
@@ -1071,6 +1065,17 @@ spdk_vtophys_notify(void *cb_ctx, struct spdk_mem_map *map,
 						DEBUG_PRINT("invalid paddr 0x%" PRIx64 " - must be 2MB aligned\n", paddr);
 						return -EINVAL;
 					}
+#if SPDK_VFIO_ENABLED
+					/* If the IOMMU is on, but DPDK is using iova-mode=pa, we want to register this memory
+					 * with the IOMMU using the physical address to match. */
+					if (spdk_iommu_is_enabled()) {
+						rc = vtophys_iommu_map_dma((uint64_t)vaddr, paddr, VALUE_2MB);
+						if (rc) {
+							DEBUG_PRINT("Unable to assign vaddr %p to paddr 0x%" PRIx64 "\n", vaddr, paddr);
+							return -EFAULT;
+						}
+					}
+#endif
 
 					rc = spdk_mem_map_set_translation(map, (uint64_t)vaddr, VALUE_2MB, paddr);
 					if (rc != 0) {
@@ -1110,13 +1115,50 @@ spdk_vtophys_notify(void *cb_ctx, struct spdk_mem_map *map,
 			 */
 			if (spdk_iommu_is_enabled()) {
 				uint64_t buffer_len = len;
-				paddr = spdk_mem_map_translate(map, (uint64_t)vaddr, &buffer_len);
-				if (buffer_len != len) {
-					return -EINVAL;
-				}
-				rc = vtophys_iommu_unmap_dma(paddr, len);
-				if (rc) {
-					return -EFAULT;
+				uint8_t *va = vaddr;
+				enum rte_iova_mode iova_mode;
+
+#if RTE_VERSION >= RTE_VERSION_NUM(19, 11, 0, 0)
+				iova_mode = rte_eal_iova_mode();
+#else
+				iova_mode = rte_eal_get_configuration()->iova_mode;
+#endif
+				/*
+				 * In virtual address mode, the region is contiguous and can be done in
+				 * one unmap.
+				 */
+				if (iova_mode == RTE_IOVA_VA) {
+					paddr = spdk_mem_map_translate(map, (uint64_t)va, &buffer_len);
+					if (buffer_len != len || paddr != (uintptr_t)va) {
+						DEBUG_PRINT("Unmapping %p with length %lu failed because "
+							    "translation had address 0x%" PRIx64 " and length %lu\n",
+							    va, len, paddr, buffer_len);
+						return -EINVAL;
+					}
+					rc = vtophys_iommu_unmap_dma(paddr, len);
+					if (rc) {
+						DEBUG_PRINT("Failed to iommu unmap paddr 0x%" PRIx64 "\n", paddr);
+						return -EFAULT;
+					}
+				} else if (iova_mode == RTE_IOVA_PA) {
+					/* Get paddr for each 2MB chunk in this address range */
+					while (buffer_len > 0) {
+						paddr = spdk_mem_map_translate(map, (uint64_t)va, NULL);
+
+						if (paddr == SPDK_VTOPHYS_ERROR || buffer_len < VALUE_2MB) {
+							DEBUG_PRINT("could not get phys addr for %p\n", va);
+							return -EFAULT;
+						}
+
+						rc = vtophys_iommu_unmap_dma(paddr, VALUE_2MB);
+						if (rc) {
+							DEBUG_PRINT("Failed to iommu unmap paddr 0x%" PRIx64 "\n", paddr);
+							return -EFAULT;
+						}
+
+						va += VALUE_2MB;
+						buffer_len -= VALUE_2MB;
+					}
 				}
 			}
 		}

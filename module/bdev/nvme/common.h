@@ -53,11 +53,20 @@ enum nvme_bdev_ns_type {
 struct nvme_bdev_ns {
 	uint32_t		id;
 	enum nvme_bdev_ns_type	type;
+	/** Marks whether this data structure has its bdevs
+	 *  populated for the associated namespace.  It is used
+	 *  to keep track if we need manage the populated
+	 *  resources when a newly active namespace is found,
+	 *  or when a namespace becomes inactive.
+	 */
 	bool			populated;
 	struct spdk_nvme_ns	*ns;
 	struct nvme_bdev_ctrlr	*ctrlr;
 	TAILQ_HEAD(, nvme_bdev)	bdevs;
+	void			*type_ctx;
 };
+
+struct ocssd_bdev_ctrlr;
 
 struct nvme_bdev_ctrlr {
 	/**
@@ -86,6 +95,15 @@ struct nvme_bdev_ctrlr {
 
 	struct spdk_poller		*adminq_timer_poller;
 
+	struct ocssd_bdev_ctrlr		*ocssd_ctrlr;
+	/**
+	 * Temporary workaround to distinguish between controllers managed by
+	 * bdev_ocssd and those used by bdev_ftl.  Once bdev_ftl becomes a
+	 * virtual bdev and starts using bdevs instead of controllers, this flag
+	 * can be removed.
+	 */
+	bool				ftl_managed;
+
 	/** linked list pointer for device list */
 	TAILQ_ENTRY(nvme_bdev_ctrlr)	tailq;
 };
@@ -110,7 +128,26 @@ struct nvme_async_probe_ctx {
 	struct spdk_nvme_ctrlr_opts opts;
 	spdk_bdev_create_nvme_fn cb_fn;
 	void *cb_ctx;
+	uint32_t populates_in_progress;
 };
+
+struct ocssd_io_channel;
+
+struct nvme_io_channel {
+	struct spdk_nvme_qpair		*qpair;
+	struct spdk_poller		*poller;
+	TAILQ_HEAD(, spdk_bdev_io)	pending_resets;
+
+	bool				collect_spin_stat;
+	uint64_t			spin_ticks;
+	uint64_t			start_ticks;
+	uint64_t			end_ticks;
+
+	struct ocssd_io_channel		*ocssd_ioch;
+};
+
+void nvme_ctrlr_populate_namespace_done(struct nvme_async_probe_ctx *ctx,
+					struct nvme_bdev_ns *ns, int rc);
 
 struct nvme_bdev_ctrlr *nvme_bdev_ctrlr_get(const struct spdk_nvme_transport_id *trid);
 struct nvme_bdev_ctrlr *nvme_bdev_ctrlr_get_by_name(const char *name);

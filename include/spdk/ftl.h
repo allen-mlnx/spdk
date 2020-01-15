@@ -103,12 +103,6 @@ struct spdk_ftl_conf {
 	} nv_cache;
 };
 
-/* Range of parallel units (inclusive) */
-struct spdk_ftl_punit_range {
-	unsigned int				begin;
-	unsigned int				end;
-};
-
 enum spdk_ftl_mode {
 	/* Create new device */
 	SPDK_FTL_MODE_CREATE = (1 << 0),
@@ -131,8 +125,6 @@ struct spdk_ftl_dev_init_opts {
 	const struct spdk_ftl_conf		*conf;
 	/* Device's name */
 	const char				*name;
-	/* Parallel unit range */
-	struct spdk_ftl_punit_range		range;
 	/* Mode flags */
 	unsigned int				mode;
 	/* Device UUID (valid when restoring device from disk) */
@@ -142,53 +134,22 @@ struct spdk_ftl_dev_init_opts {
 struct spdk_ftl_attrs {
 	/* Device's UUID */
 	struct spdk_uuid			uuid;
-	/* Parallel unit range */
-	struct spdk_ftl_punit_range		range;
 	/* Number of logical blocks */
 	uint64_t				lbk_cnt;
 	/* Logical block size */
 	size_t					lbk_size;
 	/* Write buffer cache */
 	struct spdk_bdev_desc			*cache_bdev_desc;
-	/* Number of chunks per parallel unit in the underlying device (including any offline ones) */
-	size_t					num_chunks;
-	/* Number of sectors per chunk */
-	size_t					chunk_size;
+	/* Number of zones per parallel unit in the underlying device (including any offline ones) */
+	size_t					num_zones;
+	/* Number of logical blocks per zone */
+	size_t					zone_size;
 	/* Device specific configuration */
 	struct spdk_ftl_conf			conf;
 };
 
-struct ftl_module_init_opts {
-	/* Thread on which to poll for ANM events */
-	struct spdk_thread			*anm_thread;
-};
-
 typedef void (*spdk_ftl_fn)(void *, int);
 typedef void (*spdk_ftl_init_fn)(struct spdk_ftl_dev *, void *, int);
-
-/**
- * Initialize the FTL module.
- *
- * \param opts module configuration
- * \param cb callback function to call when the module is initialized
- * \param cb_arg callback's argument
- *
- * \return 0 if successfully started initialization, negative values if
- * resources could not be allocated.
- */
-int spdk_ftl_module_init(const struct ftl_module_init_opts *opts, spdk_ftl_fn cb, void *cb_arg);
-
-/**
- * Deinitialize the FTL module. All FTL devices have to be unregistered prior to
- * calling this function.
- *
- * \param cb callback function to call when the deinitialization is completed
- * \param cb_arg callback's argument
- *
- * \return 0 if successfully scheduled deinitialization, negative errno
- * otherwise.
- */
-int spdk_ftl_module_fini(spdk_ftl_fn cb, void *cb_arg);
 
 /**
  * Initialize the FTL on given NVMe device and parallel unit range.

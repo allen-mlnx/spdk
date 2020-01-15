@@ -9,8 +9,6 @@ source $rootdir/test/iscsi_tgt/common.sh
 # $2 = test type posix or vpp. defaults to posix.
 iscsitestinit $1 $2
 
-timing_enter initiator
-
 MALLOC_BDEV_SIZE=64
 MALLOC_BLOCK_SIZE=512
 
@@ -56,5 +54,3 @@ trap - SIGINT SIGTERM EXIT
 killprocess $pid
 
 iscsitestfini $1 $2
-report_test_completion "iscsi_initiator"
-timing_exit initiator

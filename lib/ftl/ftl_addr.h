@@ -31,40 +31,71 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef FTL_ANM_H
-#define FTL_ANM_H
+#ifndef FTL_ADDR_H
+#define FTL_ADDR_H
 
-#include "spdk/thread.h"
-#include "ftl_ppa.h"
+#include "spdk/stdinc.h"
 
-struct ftl_nvme_ctrlr;
-struct ftl_anm_event;
-struct spdk_ftl_dev;
+/* Marks address as invalid */
+#define FTL_ADDR_INVALID	(-1)
+/* Marks LBA as invalid */
+#define FTL_LBA_INVALID		((uint64_t)-1)
+/* Smallest data unit size */
+#define FTL_BLOCK_SIZE		4096
 
-typedef void (*ftl_anm_fn)(struct ftl_anm_event *event);
+/* This structure represents on-disk address. It can have one of the following */
+/* formats: */
+/*        - addr describing the raw address */
+/*        - cache_offset inside the cache (indicated by the cached flag) */
+/*        - packed version of the two formats above (can be only used when the */
+/*          raw address can be represented in less than 32 bits) */
+/* Packed format is used, when possible, to avoid wasting RAM on the L2P table. */
+struct ftl_addr {
+	union {
+		struct {
+			uint64_t offset	 : 32;
+			uint64_t zone_id : 16;
+			uint64_t pu	 : 15;
+			uint64_t rsvd	 : 1;
+		};
 
-enum ftl_anm_range {
-	FTL_ANM_RANGE_LBK,
-	FTL_ANM_RANGE_CHK,
-	FTL_ANM_RANGE_PU,
-	FTL_ANM_RANGE_MAX,
+		struct {
+			uint64_t cache_offset : 63;
+			uint64_t cached	      : 1;
+		};
+
+		struct {
+			union {
+				struct  {
+					uint32_t cache_offset : 31;
+					uint32_t cached	      : 1;
+				};
+
+				uint32_t addr;
+			};
+			uint32_t rsvd;
+		} pack;
+
+		uint64_t addr;
+	};
 };
 
-struct ftl_anm_event {
-	/* Owner device */
-	struct spdk_ftl_dev		*dev;
+struct ftl_ppa_fmt {
+	/* Logical block */
+	unsigned int				lbk_offset;
+	unsigned int				lbk_mask;
 
-	/* Start PPA */
-	struct ftl_ppa			ppa;
+	/* Chunk */
+	unsigned int				chk_offset;
+	unsigned int				chk_mask;
 
-	/* Number of logical blocks */
-	size_t				num_lbks;
+	/* Parallel unit (NAND die) */
+	unsigned int				pu_offset;
+	unsigned int				pu_mask;
+
+	/* Group */
+	unsigned int				grp_offset;
+	unsigned int				grp_mask;
 };
 
-int	ftl_anm_init(struct spdk_thread *thread, spdk_ftl_fn cb, void *cb_arg);
-int	ftl_anm_free(spdk_ftl_fn cb, void *cb_arg);
-int	ftl_anm_register_device(struct spdk_ftl_dev *dev, ftl_anm_fn fn);
-int	ftl_anm_unregister_device(struct spdk_ftl_dev *dev, spdk_ftl_fn cb);
-void	ftl_anm_event_complete(struct ftl_anm_event *event);
-
-#endif /* FTL_ANM_H */
+#endif /* FTL_ADDR_H */

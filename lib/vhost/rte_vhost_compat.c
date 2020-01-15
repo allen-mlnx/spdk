@@ -49,23 +49,29 @@
 #include "spdk_internal/vhost_user.h"
 #include "spdk_internal/memory.h"
 
+static inline void
+vhost_session_mem_region_calc(uint64_t *previous_start, uint64_t *start, uint64_t *end,
+			      uint64_t *len, struct rte_vhost_mem_region *region)
+{
+	*start = FLOOR_2MB(region->mmap_addr);
+	*end = CEIL_2MB(region->mmap_addr + region->mmap_size);
+	if (*start == *previous_start) {
+		*start += (size_t) VALUE_2MB;
+	}
+	*previous_start = *start;
+	*len = *end - *start;
+}
+
 void
 vhost_session_mem_register(struct rte_vhost_memory *mem)
 {
-	struct rte_vhost_mem_region *region;
+	uint64_t start, end, len;
 	uint32_t i;
 	uint64_t previous_start = UINT64_MAX;
 
+
 	for (i = 0; i < mem->nregions; i++) {
-		uint64_t start, end, len;
-		region = &mem->regions[i];
-		start = FLOOR_2MB(region->mmap_addr);
-		end = CEIL_2MB(region->mmap_addr + region->mmap_size);
-		if (start == previous_start) {
-			start += (size_t) VALUE_2MB;
-		}
-		previous_start = start;
-		len = end - start;
+		vhost_session_mem_region_calc(&previous_start, &start, &end, &len, &mem->regions[i]);
 		SPDK_INFOLOG(SPDK_LOG_VHOST, "Registering VM memory for vtophys translation - 0x%jx len:0x%jx\n",
 			     start, len);
 
@@ -80,21 +86,12 @@ vhost_session_mem_register(struct rte_vhost_memory *mem)
 void
 vhost_session_mem_unregister(struct rte_vhost_memory *mem)
 {
-	struct rte_vhost_mem_region *region;
+	uint64_t start, end, len;
 	uint32_t i;
 	uint64_t previous_start = UINT64_MAX;
 
 	for (i = 0; i < mem->nregions; i++) {
-		uint64_t start, end, len;
-		region = &mem->regions[i];
-		start = FLOOR_2MB(region->mmap_addr);
-		end = CEIL_2MB(region->mmap_addr + region->mmap_size);
-		if (start == previous_start) {
-			start += (size_t) VALUE_2MB;
-		}
-		previous_start = start;
-		len = end - start;
-
+		vhost_session_mem_region_calc(&previous_start, &start, &end, &len, &mem->regions[i]);
 		if (spdk_vtophys((void *) start, NULL) == SPDK_VTOPHYS_ERROR) {
 			continue; /* region has not been registered */
 		}
@@ -136,14 +133,14 @@ destroy_connection(int vid)
 	vhost_destroy_connection_cb(vid);
 }
 
-const struct vhost_device_ops g_spdk_vhost_ops = {
+static const struct vhost_device_ops g_spdk_vhost_ops = {
 	.new_device =  start_device,
 	.destroy_device = stop_device,
 	.new_connection = new_connection,
 	.destroy_connection = destroy_connection,
 #ifdef SPDK_CONFIG_VHOST_INTERNAL_LIB
-	.get_config = get_config,
-	.set_config = set_config,
+	.get_config = vhost_get_config_cb,
+	.set_config = vhost_set_config_cb,
 	.vhost_nvme_admin_passthrough = vhost_nvme_admin_passthrough,
 	.vhost_nvme_set_cq_call = vhost_nvme_set_cq_call,
 	.vhost_nvme_get_cap = vhost_nvme_get_cap,
@@ -329,11 +326,11 @@ vhost_session_install_rte_compat_hooks(struct spdk_vhost_session *vsession)
 
 int
 vhost_register_unix_socket(const char *path, const char *ctrl_name,
-			   uint64_t virtio_features, uint64_t disabled_features)
+			   uint64_t virtio_features, uint64_t disabled_features, uint64_t protocol_features)
 {
 	struct stat file_stat;
 #ifndef SPDK_CONFIG_VHOST_INTERNAL_LIB
-	uint64_t protocol_features = 0;
+	uint64_t features = 0;
 #endif
 
 	/* Register vhost driver to handle vhost messages. */
@@ -371,9 +368,9 @@ vhost_register_unix_socket(const char *path, const char *ctrl_name,
 	}
 
 #ifndef SPDK_CONFIG_VHOST_INTERNAL_LIB
-	rte_vhost_driver_get_protocol_features(path, &protocol_features);
-	protocol_features |= (1ULL << VHOST_USER_PROTOCOL_F_CONFIG);
-	rte_vhost_driver_set_protocol_features(path, protocol_features);
+	rte_vhost_driver_get_protocol_features(path, &features);
+	features |= protocol_features;
+	rte_vhost_driver_set_protocol_features(path, features);
 #endif
 
 	if (rte_vhost_driver_start(path) != 0) {

@@ -222,6 +222,7 @@ struct spdk_bdev_fn_table {
 
 /** bdev I/O completion status */
 enum spdk_bdev_io_status {
+	SPDK_BDEV_IO_STATUS_MISCOMPARE = -5,
 	/*
 	 * NOMEM should be returned when a bdev module cannot start an I/O because of
 	 *  some lack of resources.  It may not be returned for RESET I/O.  I/O completed
@@ -243,6 +244,7 @@ struct spdk_bdev_alias {
 
 typedef TAILQ_HEAD(, spdk_bdev_io) bdev_io_tailq_t;
 typedef STAILQ_HEAD(, spdk_bdev_io) bdev_io_stailq_t;
+typedef TAILQ_HEAD(, lba_range) lba_range_tailq_t;
 
 struct spdk_bdev {
 	/** User context passed in by the backend */
@@ -356,6 +358,11 @@ struct spdk_bdev {
 	uint32_t optimal_open_zones;
 
 	/**
+	 * Specifies whether bdev supports media management events.
+	 */
+	bool media_events;
+
+	/**
 	 * Pointer to the bdev module that registered this bdev.
 	 */
 	struct spdk_bdev_module *module;
@@ -423,6 +430,14 @@ struct spdk_bdev {
 		/** histogram enabled on this bdev */
 		bool	histogram_enabled;
 		bool	histogram_in_progress;
+
+		/** Currently locked ranges for this bdev.  Used to populate new channels. */
+		lba_range_tailq_t locked_ranges;
+
+		/** Pending locked ranges for this bdev.  These ranges are not currently
+		 *  locked due to overlapping with another locked range.
+		 */
+		lba_range_tailq_t pending_locked_ranges;
 	} internal;
 };
 
@@ -447,6 +462,9 @@ struct spdk_bdev_io {
 	/** Enumerated value representing the I/O type. */
 	uint8_t type;
 
+	/** Number of IO submission retries */
+	uint16_t num_retries;
+
 	/** A single iovec element for use by this bdev_io. */
 	struct iovec iov;
 
@@ -460,6 +478,14 @@ struct spdk_bdev_io {
 
 			/** For SG buffer cases, number of iovecs in iovec array. */
 			int iovcnt;
+
+			/** For fused operations such as COMPARE_AND_WRITE, array of iovecs
+			 *  for the second operation.
+			 */
+			struct iovec *fused_iovs;
+
+			/** Number of iovecs in fused_iovs. */
+			int fused_iovcnt;
 
 			/* Metadata buffer */
 			void *md_buf;
@@ -608,6 +634,9 @@ struct spdk_bdev_io {
 
 		/** Entry to the list need_buf of struct spdk_bdev. */
 		STAILQ_ENTRY(spdk_bdev_io) buf_link;
+
+		/** Entry to the list io_submitted of struct spdk_bdev_channel */
+		TAILQ_ENTRY(spdk_bdev_io) ch_link;
 
 		/** Enables queuing parent I/O when no bdev_ios available for split children. */
 		struct spdk_bdev_io_wait_entry waitq_entry;
@@ -1106,6 +1135,27 @@ struct spdk_bdev *spdk_bdev_part_get_base_bdev(struct spdk_bdev_part *part);
  * \return the block offset of this part from it's underlying bdev.
  */
 uint64_t spdk_bdev_part_get_offset_blocks(struct spdk_bdev_part *part);
+
+/**
+ * Push media management events.  To send the notification that new events are
+ * available, spdk_bdev_notify_media_management needs to be called.
+ *
+ * \param bdev Block device
+ * \param events Array of media events
+ * \param num_events Size of the events array
+ *
+ * \return number of events pushed or negative errno in case of failure
+ */
+int spdk_bdev_push_media_events(struct spdk_bdev *bdev, const struct spdk_bdev_media_event *events,
+				size_t num_events);
+
+/**
+ * Send SPDK_BDEV_EVENT_MEDIA_MANAGEMENT to all open descriptors that have
+ * pending media events.
+ *
+ * \param bdev Block device
+ */
+void spdk_bdev_notify_media_management(struct spdk_bdev *bdev);
 
 /*
  *  Macro used to register module for later initialization.

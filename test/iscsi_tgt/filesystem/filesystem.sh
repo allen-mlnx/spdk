@@ -10,8 +10,6 @@ source $rootdir/scripts/common.sh
 # $2 = test type posix or vpp. defaults to posix.
 iscsitestinit $1 $2
 
-timing_enter filesystem
-
 rpc_py="$rootdir/scripts/rpc.py"
 # Remove lvol bdevs and stores.
 function remove_backends() {
@@ -77,7 +75,8 @@ parted -s /dev/$dev mklabel msdos
 parted -s /dev/$dev mkpart primary '0%' '100%'
 sleep 1
 
-for fstype in "ext4" "btrfs" "xfs"; do
+function filesystem_test {
+	fstype=$1
 
 	if [ "$fstype" == "ext4" ]; then
 		mkfs.${fstype} -F /dev/${dev}1
@@ -134,7 +133,11 @@ for fstype in "ext4" "btrfs" "xfs"; do
 		rm -rf /mnt/device/aaa
 		umount /mnt/device
 	fi
-done
+}
+
+run_test "iscsi_tgt_filesystem_ext4" filesystem_test "ext4"
+run_test "iscsi_tgt_filesystem_btrfs" filesystem_test "btrfs"
+run_test "iscsi_tgt_filesystem_xfs" filesystem_test "xfs"
 
 rm -rf /mnt/device
 
@@ -144,4 +147,3 @@ iscsicleanup
 remove_backends
 killprocess $pid
 iscsitestfini $1 $2
-timing_exit filesystem

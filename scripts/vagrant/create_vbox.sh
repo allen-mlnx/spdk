@@ -7,6 +7,8 @@
 # This script creates a subdirectory called $PWD/<distro> and copies the Vagrantfile
 # into that directory before running 'vagrant up'
 
+set -e
+
 VAGRANT_TARGET="$PWD"
 
 DIR="$( cd "$( dirname $0 )" && pwd )"
@@ -17,7 +19,8 @@ display_help() {
 	echo
 	echo " Usage: ${0##*/} [-b nvme-backing-file] [-n <num-cpus>] [-s <ram-size>] [-x <http-proxy>] [-hvrld] <distro>"
 	echo
-	echo "  distro = <centos7 | ubuntu16 | ubuntu18 | fedora28 | fedora29 | fedora 30 | freebsd11> "
+	echo "  distro = <centos7 | centos8| ubuntu16 | ubuntu18 |"
+	echo "            fedora29 | fedora 30 | fedora 31 | freebsd11 | freebsd12>"
 	echo
 	echo "  -b <nvme-backing-file>          nvme file path with name"
 	echo "                                  type of emulated nvme disk"
@@ -42,10 +45,10 @@ display_help() {
 	echo
 	echo " Examples:"
 	echo
-	echo "  $0 -x http://user:password@host:port fedora28"
+	echo "  $0 -x http://user:password@host:port fedora30"
 	echo "  $0 -s 2048 -n 2 ubuntu16"
 	echo "  $0 -rv freebsd"
-	echo "  $0 fedora28"
+	echo "  $0 fedora30"
 	echo "  $0 -b /var/lib/libvirt/images/nvme1.img,nvme,1 fedora30"
 	echo "  $0 -b /var/lib/libvirt/images/ocssd.img,ocssd fedora30"
 	echo "  $0 -b /var/lib/libvirt/images/nvme5.img,nvme,5 -b /var/lib/libvirt/images/ocssd.img,ocssd fedora30"
@@ -130,10 +133,13 @@ done
 
 shift "$((OPTIND-1))"   # Discard the options and sentinel --
 
-SPDK_VAGRANT_DISTRO=( "$@" )
+SPDK_VAGRANT_DISTRO="$*"
 
-case "${SPDK_VAGRANT_DISTRO[0]}" in
+case "${SPDK_VAGRANT_DISTRO}" in
 	centos7)
+		export SPDK_VAGRANT_DISTRO
+	;;
+	centos8)
 		export SPDK_VAGRANT_DISTRO
 	;;
 	ubuntu16)
@@ -142,16 +148,19 @@ case "${SPDK_VAGRANT_DISTRO[0]}" in
 	ubuntu18)
 		export SPDK_VAGRANT_DISTRO
 	;;
-	fedora28)
-		export SPDK_VAGRANT_DISTRO
-	;;
 	fedora29)
 		export SPDK_VAGRANT_DISTRO
 	;;
 	fedora30)
 		export SPDK_VAGRANT_DISTRO
 	;;
+	fedora31)
+		export SPDK_VAGRANT_DISTRO
+	;;
 	freebsd11)
+		export SPDK_VAGRANT_DISTRO
+	;;
+	freebsd12)
 		export SPDK_VAGRANT_DISTRO
 	;;
 	arch-linux)
@@ -171,7 +180,6 @@ fi
 if [ -z "$NVME_FILE" ]; then
 	TMP="/var/lib/libvirt/images/nvme_disk.img"
 	NVME_DISKS_TYPE="nvme"
-	NVME_DISKS_NAMESPACES="1"
 else
 	TMP=""
 	for args in $NVME_FILE; do
@@ -181,7 +189,7 @@ else
 				type="nvme"
 			fi
 			NVME_DISKS_TYPE+="$type,";
-			if [ -z "$namespace" ]; then
+			if [ -z "$namespace" ] && [ -n "$SPDK_QEMU_EMULATOR" ]; then
 				namespace="1"
 			fi
 			NVME_DISKS_NAMESPACES+="$namespace,";

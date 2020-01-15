@@ -46,7 +46,7 @@
 static TAILQ_HEAD(, vhost_poll_group) g_poll_groups = TAILQ_HEAD_INITIALIZER(g_poll_groups);
 
 /* Temporary cpuset for poll group assignment */
-static struct spdk_cpuset *g_tmp_cpuset;
+static struct spdk_cpuset g_tmp_cpuset;
 
 /* Path to folder where character device will be created. Can be set by user. */
 static char dev_dirname[PATH_MAX] = "";
@@ -414,6 +414,7 @@ vhost_vq_used_ring_enqueue(struct spdk_vhost_session *vsession,
 	struct rte_vhost_vring *vring = &virtqueue->vring;
 	struct vring_used *used = vring->used;
 	uint16_t last_idx = virtqueue->last_used_idx & (vring->size - 1);
+	uint16_t vq_idx = virtqueue->vring_idx;
 
 	SPDK_DEBUGLOG(SPDK_LOG_VHOST_RING,
 		      "Queue %td - USED RING: last_idx=%"PRIu16" req id=%"PRIu16" len=%"PRIu32"\n",
@@ -428,9 +429,13 @@ vhost_vq_used_ring_enqueue(struct spdk_vhost_session *vsession,
 	/* Ensure the used ring is updated before we log it or increment used->idx. */
 	spdk_smp_wmb();
 
+	rte_vhost_set_last_inflight_io_split(vsession->vid, vq_idx, id);
+
 	vhost_log_used_vring_elem(vsession, virtqueue, last_idx);
 	* (volatile uint16_t *) &used->idx = virtqueue->last_used_idx;
 	vhost_log_used_vring_idx(vsession, virtqueue);
+
+	rte_vhost_clr_inflight_desc_split(vsession->vid, vq_idx, virtqueue->last_used_idx, id);
 
 	virtqueue->used_req_cnt++;
 }
@@ -587,7 +592,7 @@ vhost_dev_register(struct spdk_vhost_dev *vdev, const char *name, const char *ma
 		   const struct spdk_vhost_dev_backend *backend)
 {
 	char path[PATH_MAX];
-	struct spdk_cpuset *cpumask;
+	struct spdk_cpuset cpumask = {};
 	int rc;
 
 	assert(vdev);
@@ -596,13 +601,7 @@ vhost_dev_register(struct spdk_vhost_dev *vdev, const char *name, const char *ma
 		return -EINVAL;
 	}
 
-	cpumask = spdk_cpuset_alloc();
-	if (!cpumask) {
-		SPDK_ERRLOG("spdk_cpuset_alloc failed\n");
-		return -ENOMEM;
-	}
-
-	if (vhost_parse_core_mask(mask_str, cpumask) != 0) {
+	if (vhost_parse_core_mask(mask_str, &cpumask) != 0) {
 		SPDK_ERRLOG("cpumask %s is invalid (app mask is 0x%s)\n",
 			    mask_str, spdk_cpuset_fmt(spdk_app_get_core_mask()));
 		rc = -EINVAL;
@@ -631,7 +630,7 @@ vhost_dev_register(struct spdk_vhost_dev *vdev, const char *name, const char *ma
 		goto out;
 	}
 
-	vdev->cpumask = cpumask;
+	spdk_cpuset_copy(&vdev->cpumask, &cpumask);
 	vdev->registered = true;
 	vdev->backend = backend;
 	TAILQ_INIT(&vdev->vsessions);
@@ -640,7 +639,8 @@ vhost_dev_register(struct spdk_vhost_dev *vdev, const char *name, const char *ma
 	vhost_dev_set_coalescing(vdev, SPDK_VHOST_COALESCING_DELAY_BASE_US,
 				 SPDK_VHOST_VQ_IOPS_COALESCING_THRESHOLD);
 
-	if (vhost_register_unix_socket(path, name, backend->virtio_features, backend->disabled_features)) {
+	if (vhost_register_unix_socket(path, name, vdev->virtio_features, vdev->disabled_features,
+				       vdev->protocol_features)) {
 		TAILQ_REMOVE(&g_vhost_devices, vdev, tailq);
 		free(vdev->name);
 		free(vdev->path);
@@ -652,7 +652,6 @@ vhost_dev_register(struct spdk_vhost_dev *vdev, const char *name, const char *ma
 	return 0;
 
 out:
-	spdk_cpuset_free(cpumask);
 	return rc;
 }
 
@@ -675,7 +674,6 @@ vhost_dev_unregister(struct spdk_vhost_dev *vdev)
 
 	free(vdev->name);
 	free(vdev->path);
-	spdk_cpuset_free(vdev->cpumask);
 	TAILQ_REMOVE(&g_vhost_devices, vdev, tailq);
 	return 0;
 }
@@ -705,7 +703,7 @@ const struct spdk_cpuset *
 spdk_vhost_dev_get_cpumask(struct spdk_vhost_dev *vdev)
 {
 	assert(vdev != NULL);
-	return vdev->cpumask;
+	return &vdev->cpumask;
 }
 
 struct vhost_poll_group *
@@ -718,11 +716,11 @@ vhost_get_poll_group(struct spdk_cpuset *cpumask)
 	selected_pg = TAILQ_FIRST(&g_poll_groups);
 
 	TAILQ_FOREACH(pg, &g_poll_groups, tailq) {
-		spdk_cpuset_copy(g_tmp_cpuset, cpumask);
-		spdk_cpuset_and(g_tmp_cpuset, spdk_thread_get_cpumask(pg->thread));
+		spdk_cpuset_copy(&g_tmp_cpuset, cpumask);
+		spdk_cpuset_and(&g_tmp_cpuset, spdk_thread_get_cpumask(pg->thread));
 
 		/* ignore threads which could be relocated to a non-masked cpu. */
-		if (!spdk_cpuset_equal(g_tmp_cpuset, spdk_thread_get_cpumask(pg->thread))) {
+		if (!spdk_cpuset_equal(&g_tmp_cpuset, spdk_thread_get_cpumask(pg->thread))) {
 			continue;
 		}
 
@@ -1059,6 +1057,7 @@ vhost_start_device_cb(int vid)
 			continue;
 		}
 		q->vring_idx = i;
+		rte_vhost_get_vhost_ring_inflight(vid, i, &q->vring_inflight);
 
 		if (q->vring.desc == NULL || q->vring.size == 0) {
 			continue;
@@ -1382,16 +1381,10 @@ spdk_vhost_init(spdk_vhost_init_cb init_cb)
 		}
 	}
 
-	g_tmp_cpuset = spdk_cpuset_alloc();
-	if (g_tmp_cpuset == NULL) {
-		ret = -1;
-		goto err_out;
-	}
 
 	ret = sem_init(&g_dpdk_sem, 0, 0);
 	if (ret != 0) {
 		SPDK_ERRLOG("Failed to initialize semaphore for rte_vhost pthread.\n");
-		spdk_cpuset_free(g_tmp_cpuset);
 		ret = -1;
 		goto err_out;
 	}
@@ -1422,7 +1415,6 @@ _spdk_vhost_fini(void *arg1)
 
 	/* All devices are removed now. */
 	sem_destroy(&g_dpdk_sem);
-	spdk_cpuset_free(g_tmp_cpuset);
 	TAILQ_FOREACH_SAFE(pg, &g_poll_groups, tailq, tpg) {
 		TAILQ_REMOVE(&g_poll_groups, pg, tailq);
 		free(pg);

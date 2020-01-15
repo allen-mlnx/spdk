@@ -116,6 +116,10 @@ static enum spdk_bdev_io_status g_io_status;
 static enum spdk_bdev_io_status g_io_exp_status = SPDK_BDEV_IO_STATUS_SUCCESS;
 static uint32_t g_bdev_ut_io_device;
 static struct bdev_ut_channel *g_bdev_ut_channel;
+static void *g_compare_read_buf;
+static uint32_t g_compare_read_buf_len;
+static void *g_compare_write_buf;
+static uint32_t g_compare_write_buf_len;
 
 static struct ut_expected_io *
 ut_alloc_expected_io(uint8_t type, uint64_t offset, uint64_t length, int iovcnt)
@@ -149,6 +153,22 @@ stub_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 	int i;
 
 	g_bdev_io = bdev_io;
+
+	if (g_compare_read_buf && bdev_io->type == SPDK_BDEV_IO_TYPE_READ) {
+		uint32_t len = bdev_io->u.bdev.iovs[0].iov_len;
+
+		CU_ASSERT(bdev_io->u.bdev.iovcnt == 1);
+		CU_ASSERT(g_compare_read_buf_len == len);
+		memcpy(bdev_io->u.bdev.iovs[0].iov_base, g_compare_read_buf, len);
+	}
+
+	if (g_compare_write_buf && bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
+		uint32_t len = bdev_io->u.bdev.iovs[0].iov_len;
+
+		CU_ASSERT(bdev_io->u.bdev.iovcnt == 1);
+		CU_ASSERT(g_compare_write_buf_len == len);
+		memcpy(g_compare_write_buf, bdev_io->u.bdev.iovs[0].iov_base, len);
+	}
 
 	TAILQ_INSERT_TAIL(&ch->outstanding_io, bdev_io, module_link);
 	ch->outstanding_io_count++;
@@ -193,8 +213,8 @@ stub_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 }
 
 static void
-stub_submit_request_aligned_buffer_cb(struct spdk_io_channel *_ch,
-				      struct spdk_bdev_io *bdev_io, bool success)
+stub_submit_request_get_buf_cb(struct spdk_io_channel *_ch,
+			       struct spdk_bdev_io *bdev_io, bool success)
 {
 	CU_ASSERT(success == true);
 
@@ -202,9 +222,9 @@ stub_submit_request_aligned_buffer_cb(struct spdk_io_channel *_ch,
 }
 
 static void
-stub_submit_request_aligned_buffer(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
+stub_submit_request_get_buf(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 {
-	spdk_bdev_io_get_buf(bdev_io, stub_submit_request_aligned_buffer_cb,
+	spdk_bdev_io_get_buf(bdev_io, stub_submit_request_get_buf_cb,
 			     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
 }
 
@@ -1725,7 +1745,7 @@ bdev_io_alignment(void)
 	CU_ASSERT(rc == 0);
 	spdk_bdev_initialize(bdev_init_cb, NULL);
 
-	fn_table.submit_request = stub_submit_request_aligned_buffer;
+	fn_table.submit_request = stub_submit_request_get_buf;
 	bdev = allocate_bdev("bdev0");
 
 	rc = spdk_bdev_open(bdev, true, NULL, NULL, &desc);
@@ -1917,6 +1937,7 @@ bdev_io_alignment(void)
 	spdk_put_io_channel(io_ch);
 	spdk_bdev_close(desc);
 	free_bdev(bdev);
+	fn_table.submit_request = stub_submit_request;
 	spdk_bdev_finish(bdev_fini_cb, NULL);
 	poll_threads();
 
@@ -1943,7 +1964,7 @@ bdev_io_alignment_with_boundary(void)
 	CU_ASSERT(rc == 0);
 	spdk_bdev_initialize(bdev_init_cb, NULL);
 
-	fn_table.submit_request = stub_submit_request_aligned_buffer;
+	fn_table.submit_request = stub_submit_request_get_buf;
 	bdev = allocate_bdev("bdev0");
 
 	rc = spdk_bdev_open(bdev, true, NULL, NULL, &desc);
@@ -2054,6 +2075,7 @@ bdev_io_alignment_with_boundary(void)
 	spdk_put_io_channel(io_ch);
 	spdk_bdev_close(desc);
 	free_bdev(bdev);
+	fn_table.submit_request = stub_submit_request;
 	spdk_bdev_finish(bdev_fini_cb, NULL);
 	poll_threads();
 
@@ -2123,14 +2145,14 @@ bdev_histograms(void)
 
 	CU_ASSERT(g_count == 0);
 
-	rc = spdk_bdev_write_blocks(desc, ch, &buf, 0, 1, io_done, NULL);
+	rc = spdk_bdev_write_blocks(desc, ch, buf, 0, 1, io_done, NULL);
 	CU_ASSERT(rc == 0);
 
 	spdk_delay_us(10);
 	stub_complete_io(1);
 	poll_threads();
 
-	rc = spdk_bdev_read_blocks(desc, ch, &buf, 0, 1, io_done, NULL);
+	rc = spdk_bdev_read_blocks(desc, ch, buf, 0, 1, io_done, NULL);
 	CU_ASSERT(rc == 0);
 
 	spdk_delay_us(10);
@@ -2166,6 +2188,100 @@ bdev_histograms(void)
 	free_bdev(bdev);
 	spdk_bdev_finish(bdev_fini_cb, NULL);
 	poll_threads();
+}
+
+static void
+bdev_compare_and_write(void)
+{
+	struct spdk_bdev *bdev;
+	struct spdk_bdev_desc *desc = NULL;
+	struct spdk_io_channel *ioch;
+	struct ut_expected_io *expected_io;
+	uint64_t offset, num_blocks;
+	uint32_t num_completed;
+	char aa_buf[512];
+	char bb_buf[512];
+	char cc_buf[512];
+	char write_buf[512];
+	struct iovec compare_iov;
+	struct iovec write_iov;
+	int rc;
+
+	memset(aa_buf, 0xaa, sizeof(aa_buf));
+	memset(bb_buf, 0xbb, sizeof(bb_buf));
+	memset(cc_buf, 0xcc, sizeof(cc_buf));
+
+	spdk_bdev_initialize(bdev_init_cb, NULL);
+	fn_table.submit_request = stub_submit_request_get_buf;
+	bdev = allocate_bdev("bdev");
+
+	rc = spdk_bdev_open(bdev, true, NULL, NULL, &desc);
+	CU_ASSERT_EQUAL(rc, 0);
+	SPDK_CU_ASSERT_FATAL(desc != NULL);
+	ioch = spdk_bdev_get_io_channel(desc);
+	SPDK_CU_ASSERT_FATAL(ioch != NULL);
+
+	fn_table.submit_request = stub_submit_request_get_buf;
+	g_io_exp_status = SPDK_BDEV_IO_STATUS_SUCCESS;
+
+	offset = 50;
+	num_blocks = 1;
+	compare_iov.iov_base = aa_buf;
+	compare_iov.iov_len = sizeof(aa_buf);
+	write_iov.iov_base = bb_buf;
+	write_iov.iov_len = sizeof(bb_buf);
+
+	expected_io = ut_alloc_expected_io(SPDK_BDEV_IO_TYPE_READ, offset, num_blocks, 0);
+	TAILQ_INSERT_TAIL(&g_bdev_ut_channel->expected_io, expected_io, link);
+	expected_io = ut_alloc_expected_io(SPDK_BDEV_IO_TYPE_WRITE, offset, num_blocks, 0);
+	TAILQ_INSERT_TAIL(&g_bdev_ut_channel->expected_io, expected_io, link);
+
+	g_io_done = false;
+	g_compare_read_buf = aa_buf;
+	g_compare_read_buf_len = sizeof(aa_buf);
+	memset(write_buf, 0, sizeof(write_buf));
+	g_compare_write_buf = write_buf;
+	g_compare_write_buf_len = sizeof(write_buf);
+	rc = spdk_bdev_comparev_and_writev_blocks(desc, ioch, &compare_iov, 1, &write_iov, 1,
+			offset, num_blocks, io_done, NULL);
+	CU_ASSERT_EQUAL(rc, 0);
+	num_completed = stub_complete_io(1);
+	CU_ASSERT_EQUAL(num_completed, 1);
+	CU_ASSERT(g_io_done == false);
+	num_completed = stub_complete_io(1);
+	CU_ASSERT_EQUAL(num_completed, 1);
+	CU_ASSERT(g_io_done == true);
+	CU_ASSERT(g_io_status == SPDK_BDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(memcmp(write_buf, bb_buf, sizeof(write_buf)) == 0);
+
+	expected_io = ut_alloc_expected_io(SPDK_BDEV_IO_TYPE_READ, offset, num_blocks, 0);
+	TAILQ_INSERT_TAIL(&g_bdev_ut_channel->expected_io, expected_io, link);
+
+	g_io_done = false;
+	g_compare_read_buf = cc_buf;
+	g_compare_read_buf_len = sizeof(cc_buf);
+	memset(write_buf, 0, sizeof(write_buf));
+	g_compare_write_buf = write_buf;
+	g_compare_write_buf_len = sizeof(write_buf);
+	rc = spdk_bdev_comparev_and_writev_blocks(desc, ioch, &compare_iov, 1, &write_iov, 1,
+			offset, num_blocks, io_done, NULL);
+	CU_ASSERT_EQUAL(rc, 0);
+	num_completed = stub_complete_io(1);
+	CU_ASSERT_EQUAL(num_completed, 1);
+	CU_ASSERT(g_io_done == true);
+	CU_ASSERT(g_io_status == SPDK_BDEV_IO_STATUS_MISCOMPARE);
+	num_completed = stub_complete_io(1);
+	CU_ASSERT_EQUAL(num_completed, 0);
+
+	spdk_put_io_channel(ioch);
+	spdk_bdev_close(desc);
+	free_bdev(bdev);
+	fn_table.submit_request = stub_submit_request;
+	spdk_bdev_finish(bdev_fini_cb, NULL);
+	poll_threads();
+
+	g_compare_read_buf = NULL;
+	g_compare_write_buf = NULL;
 }
 
 static void
@@ -2364,6 +2480,531 @@ bdev_open_ext(void)
 	poll_threads();
 }
 
+struct timeout_io_cb_arg {
+	struct iovec iov;
+	uint8_t type;
+};
+
+static int
+bdev_channel_count_submitted_io(struct spdk_bdev_channel *ch)
+{
+	struct spdk_bdev_io *bdev_io;
+	int n = 0;
+
+	if (!ch) {
+		return -1;
+	}
+
+	TAILQ_FOREACH(bdev_io, &ch->io_submitted, internal.ch_link) {
+		n++;
+	}
+
+	return n;
+}
+
+static void
+bdev_channel_io_timeout_cb(void *cb_arg, struct spdk_bdev_io *bdev_io)
+{
+	struct timeout_io_cb_arg *ctx = cb_arg;
+
+	ctx->type = bdev_io->type;
+	ctx->iov.iov_base = bdev_io->iov.iov_base;
+	ctx->iov.iov_len = bdev_io->iov.iov_len;
+}
+
+static void
+bdev_set_io_timeout(void)
+{
+	struct spdk_bdev *bdev;
+	struct spdk_bdev_desc *desc = NULL;
+	struct spdk_io_channel *io_ch = NULL;
+	struct spdk_bdev_channel *bdev_ch = NULL;
+	struct timeout_io_cb_arg cb_arg;
+
+	spdk_bdev_initialize(bdev_init_cb, NULL);
+
+	bdev = allocate_bdev("bdev");
+
+	CU_ASSERT(spdk_bdev_open(bdev, true, NULL, NULL, &desc) == 0);
+	SPDK_CU_ASSERT_FATAL(desc != NULL);
+	io_ch = spdk_bdev_get_io_channel(desc);
+	CU_ASSERT(io_ch != NULL);
+
+	bdev_ch = spdk_io_channel_get_ctx(io_ch);
+	CU_ASSERT(TAILQ_EMPTY(&bdev_ch->io_submitted));
+
+	/* This is the part1.
+	 * We will check the bdev_ch->io_submitted list
+	 * TO make sure that it can link IOs and only the user submitted IOs
+	 */
+	CU_ASSERT(spdk_bdev_read(desc, io_ch, (void *)0x1000, 0, 4096, io_done, NULL) == 0);
+	CU_ASSERT(bdev_channel_count_submitted_io(bdev_ch) == 1);
+	CU_ASSERT(spdk_bdev_write(desc, io_ch, (void *)0x2000, 0, 4096, io_done, NULL) == 0);
+	CU_ASSERT(bdev_channel_count_submitted_io(bdev_ch) == 2);
+	stub_complete_io(1);
+	CU_ASSERT(bdev_channel_count_submitted_io(bdev_ch) == 1);
+	stub_complete_io(1);
+	CU_ASSERT(bdev_channel_count_submitted_io(bdev_ch) == 0);
+
+	/* Split IO */
+	bdev->optimal_io_boundary = 16;
+	bdev->split_on_optimal_io_boundary = true;
+
+	/* Now test that a single-vector command is split correctly.
+	 * Offset 14, length 8, payload 0xF000
+	 *  Child - Offset 14, length 2, payload 0xF000
+	 *  Child - Offset 16, length 6, payload 0xF000 + 2 * 512
+	 *
+	 * Set up the expected values before calling spdk_bdev_read_blocks
+	 */
+	CU_ASSERT(spdk_bdev_read_blocks(desc, io_ch, (void *)0xF000, 14, 8, io_done, NULL) == 0);
+	/* We only count the submitted IO by the user
+	 * Even the IO split into two IOs but we only count one.
+	 * Becauce the user only see one IO.
+	 */
+	CU_ASSERT(bdev_channel_count_submitted_io(bdev_ch) == 1);
+	stub_complete_io(1);
+	CU_ASSERT(bdev_channel_count_submitted_io(bdev_ch) == 1);
+	stub_complete_io(1);
+	CU_ASSERT(bdev_channel_count_submitted_io(bdev_ch) == 0);
+
+	/* Also include the reset IO */
+	CU_ASSERT(spdk_bdev_reset(desc, io_ch, io_done, NULL) == 0);
+	CU_ASSERT(bdev_channel_count_submitted_io(bdev_ch) == 1);
+	poll_threads();
+	stub_complete_io(1);
+	poll_threads();
+	CU_ASSERT(bdev_channel_count_submitted_io(bdev_ch) == 0);
+
+	/* This is part2
+	 * Test the desc timeout poller register
+	 */
+
+	/* Successfully set the timeout */
+	CU_ASSERT(spdk_bdev_set_timeout(desc, 30, bdev_channel_io_timeout_cb, &cb_arg) == 0);
+	CU_ASSERT(desc->io_timeout_poller != NULL);
+	CU_ASSERT(desc->timeout_in_sec == 30);
+	CU_ASSERT(desc->cb_fn == bdev_channel_io_timeout_cb);
+	CU_ASSERT(desc->cb_arg == &cb_arg);
+
+	/* Change the timeout limit */
+	CU_ASSERT(spdk_bdev_set_timeout(desc, 20, bdev_channel_io_timeout_cb, &cb_arg) == 0);
+	CU_ASSERT(desc->io_timeout_poller != NULL);
+	CU_ASSERT(desc->timeout_in_sec == 20);
+	CU_ASSERT(desc->cb_fn == bdev_channel_io_timeout_cb);
+	CU_ASSERT(desc->cb_arg == &cb_arg);
+
+	/* Disable the timeout */
+	CU_ASSERT(spdk_bdev_set_timeout(desc, 0, NULL, NULL) == 0);
+	CU_ASSERT(desc->io_timeout_poller == NULL);
+
+	/* This the part3
+	 * We will test to catch timeout IO and check whether the IO is
+	 * the submitted one.
+	 */
+	memset(&cb_arg, 0, sizeof(cb_arg));
+	CU_ASSERT(spdk_bdev_set_timeout(desc, 30, bdev_channel_io_timeout_cb, &cb_arg) == 0);
+	CU_ASSERT(spdk_bdev_write_blocks(desc, io_ch, (void *)0x1000, 0, 1, io_done, NULL) == 0);
+
+	/* Don't reach the limit */
+	spdk_delay_us(15 * spdk_get_ticks_hz());
+	poll_threads();
+	CU_ASSERT(cb_arg.type == 0);
+	CU_ASSERT(cb_arg.iov.iov_base == (void *)0x0);
+	CU_ASSERT(cb_arg.iov.iov_len == 0);
+
+	/* 15 + 15 = 30 reach the limit */
+	spdk_delay_us(15 * spdk_get_ticks_hz());
+	poll_threads();
+	CU_ASSERT(cb_arg.type == SPDK_BDEV_IO_TYPE_WRITE);
+	CU_ASSERT(cb_arg.iov.iov_base == (void *)0x1000);
+	CU_ASSERT(cb_arg.iov.iov_len == 1 * bdev->blocklen);
+	stub_complete_io(1);
+
+	/* Use the same split IO above and check the IO */
+	memset(&cb_arg, 0, sizeof(cb_arg));
+	CU_ASSERT(spdk_bdev_write_blocks(desc, io_ch, (void *)0xF000, 14, 8, io_done, NULL) == 0);
+
+	/* The first child complete in time */
+	spdk_delay_us(15 * spdk_get_ticks_hz());
+	poll_threads();
+	stub_complete_io(1);
+	CU_ASSERT(cb_arg.type == 0);
+	CU_ASSERT(cb_arg.iov.iov_base == (void *)0x0);
+	CU_ASSERT(cb_arg.iov.iov_len == 0);
+
+	/* The second child reach the limit */
+	spdk_delay_us(15 * spdk_get_ticks_hz());
+	poll_threads();
+	CU_ASSERT(cb_arg.type == SPDK_BDEV_IO_TYPE_WRITE);
+	CU_ASSERT(cb_arg.iov.iov_base == (void *)0xF000);
+	CU_ASSERT(cb_arg.iov.iov_len == 8 * bdev->blocklen);
+	stub_complete_io(1);
+
+	/* Also include the reset IO */
+	memset(&cb_arg, 0, sizeof(cb_arg));
+	CU_ASSERT(spdk_bdev_reset(desc, io_ch, io_done, NULL) == 0);
+	spdk_delay_us(30 * spdk_get_ticks_hz());
+	poll_threads();
+	CU_ASSERT(cb_arg.type == SPDK_BDEV_IO_TYPE_RESET);
+	stub_complete_io(1);
+	poll_threads();
+
+	spdk_put_io_channel(io_ch);
+	spdk_bdev_close(desc);
+	free_bdev(bdev);
+	spdk_bdev_finish(bdev_fini_cb, NULL);
+	poll_threads();
+}
+
+static void
+lba_range_overlap(void)
+{
+	struct lba_range r1, r2;
+
+	r1.offset = 100;
+	r1.length = 50;
+
+	r2.offset = 0;
+	r2.length = 1;
+	CU_ASSERT(!bdev_lba_range_overlapped(&r1, &r2));
+
+	r2.offset = 0;
+	r2.length = 100;
+	CU_ASSERT(!bdev_lba_range_overlapped(&r1, &r2));
+
+	r2.offset = 0;
+	r2.length = 110;
+	CU_ASSERT(bdev_lba_range_overlapped(&r1, &r2));
+
+	r2.offset = 100;
+	r2.length = 10;
+	CU_ASSERT(bdev_lba_range_overlapped(&r1, &r2));
+
+	r2.offset = 110;
+	r2.length = 20;
+	CU_ASSERT(bdev_lba_range_overlapped(&r1, &r2));
+
+	r2.offset = 140;
+	r2.length = 150;
+	CU_ASSERT(bdev_lba_range_overlapped(&r1, &r2));
+
+	r2.offset = 130;
+	r2.length = 200;
+	CU_ASSERT(bdev_lba_range_overlapped(&r1, &r2));
+
+	r2.offset = 150;
+	r2.length = 100;
+	CU_ASSERT(!bdev_lba_range_overlapped(&r1, &r2));
+
+	r2.offset = 110;
+	r2.length = 0;
+	CU_ASSERT(!bdev_lba_range_overlapped(&r1, &r2));
+}
+
+static bool g_lock_lba_range_done;
+static bool g_unlock_lba_range_done;
+
+static void
+lock_lba_range_done(void *ctx, int status)
+{
+	g_lock_lba_range_done = true;
+}
+
+static void
+unlock_lba_range_done(void *ctx, int status)
+{
+	g_unlock_lba_range_done = true;
+}
+
+static void
+lock_lba_range_check_ranges(void)
+{
+	struct spdk_bdev *bdev;
+	struct spdk_bdev_desc *desc = NULL;
+	struct spdk_io_channel *io_ch;
+	struct spdk_bdev_channel *channel;
+	struct lba_range *range;
+	int ctx1;
+	int rc;
+
+	spdk_bdev_initialize(bdev_init_cb, NULL);
+
+	bdev = allocate_bdev("bdev0");
+
+	rc = spdk_bdev_open(bdev, true, NULL, NULL, &desc);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(desc != NULL);
+	io_ch = spdk_bdev_get_io_channel(desc);
+	CU_ASSERT(io_ch != NULL);
+	channel = spdk_io_channel_get_ctx(io_ch);
+
+	g_lock_lba_range_done = false;
+	rc = bdev_lock_lba_range(desc, io_ch, 20, 10, lock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	CU_ASSERT(g_lock_lba_range_done == true);
+	range = TAILQ_FIRST(&channel->locked_ranges);
+	SPDK_CU_ASSERT_FATAL(range != NULL);
+	CU_ASSERT(range->offset == 20);
+	CU_ASSERT(range->length == 10);
+	CU_ASSERT(range->owner_ch == channel);
+
+	/* Unlocks must exactly match a lock. */
+	g_unlock_lba_range_done = false;
+	rc = bdev_unlock_lba_range(desc, io_ch, 20, 1, unlock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == -EINVAL);
+	CU_ASSERT(g_unlock_lba_range_done == false);
+
+	rc = bdev_unlock_lba_range(desc, io_ch, 20, 10, unlock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == 0);
+	spdk_delay_us(100);
+	poll_threads();
+
+	CU_ASSERT(g_unlock_lba_range_done == true);
+	CU_ASSERT(TAILQ_EMPTY(&channel->locked_ranges));
+
+	spdk_put_io_channel(io_ch);
+	spdk_bdev_close(desc);
+	free_bdev(bdev);
+	spdk_bdev_finish(bdev_fini_cb, NULL);
+	poll_threads();
+}
+
+static void
+lock_lba_range_with_io_outstanding(void)
+{
+	struct spdk_bdev *bdev;
+	struct spdk_bdev_desc *desc = NULL;
+	struct spdk_io_channel *io_ch;
+	struct spdk_bdev_channel *channel;
+	struct lba_range *range;
+	char buf[4096];
+	int ctx1;
+	int rc;
+
+	spdk_bdev_initialize(bdev_init_cb, NULL);
+
+	bdev = allocate_bdev("bdev0");
+
+	rc = spdk_bdev_open(bdev, true, NULL, NULL, &desc);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(desc != NULL);
+	io_ch = spdk_bdev_get_io_channel(desc);
+	CU_ASSERT(io_ch != NULL);
+	channel = spdk_io_channel_get_ctx(io_ch);
+
+	g_io_done = false;
+	rc = spdk_bdev_read_blocks(desc, io_ch, buf, 20, 1, io_done, &ctx1);
+	CU_ASSERT(rc == 0);
+
+	g_lock_lba_range_done = false;
+	rc = bdev_lock_lba_range(desc, io_ch, 20, 10, lock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	/* The lock should immediately become valid, since there are no outstanding
+	 * write I/O.
+	 */
+	CU_ASSERT(g_io_done == false);
+	CU_ASSERT(g_lock_lba_range_done == true);
+	range = TAILQ_FIRST(&channel->locked_ranges);
+	SPDK_CU_ASSERT_FATAL(range != NULL);
+	CU_ASSERT(range->offset == 20);
+	CU_ASSERT(range->length == 10);
+	CU_ASSERT(range->owner_ch == channel);
+	CU_ASSERT(range->locked_ctx == &ctx1);
+
+	rc = bdev_unlock_lba_range(desc, io_ch, 20, 10, lock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == 0);
+	stub_complete_io(1);
+	spdk_delay_us(100);
+	poll_threads();
+
+	CU_ASSERT(TAILQ_EMPTY(&channel->locked_ranges));
+
+	/* Now try again, but with a write I/O. */
+	g_io_done = false;
+	rc = spdk_bdev_write_blocks(desc, io_ch, buf, 20, 1, io_done, &ctx1);
+	CU_ASSERT(rc == 0);
+
+	g_lock_lba_range_done = false;
+	rc = bdev_lock_lba_range(desc, io_ch, 20, 10, lock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	/* The lock should not be fully valid yet, since a write I/O is outstanding.
+	 * But note that the range should be on the channel's locked_list, to make sure no
+	 * new write I/O are started.
+	 */
+	CU_ASSERT(g_io_done == false);
+	CU_ASSERT(g_lock_lba_range_done == false);
+	range = TAILQ_FIRST(&channel->locked_ranges);
+	SPDK_CU_ASSERT_FATAL(range != NULL);
+	CU_ASSERT(range->offset == 20);
+	CU_ASSERT(range->length == 10);
+
+	/* Complete the write I/O.  This should make the lock valid (checked by confirming
+	 * our callback was invoked).
+	 */
+	stub_complete_io(1);
+	spdk_delay_us(100);
+	poll_threads();
+	CU_ASSERT(g_io_done == true);
+	CU_ASSERT(g_lock_lba_range_done == true);
+
+	rc = bdev_unlock_lba_range(desc, io_ch, 20, 10, unlock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	CU_ASSERT(TAILQ_EMPTY(&channel->locked_ranges));
+
+	spdk_put_io_channel(io_ch);
+	spdk_bdev_close(desc);
+	free_bdev(bdev);
+	spdk_bdev_finish(bdev_fini_cb, NULL);
+	poll_threads();
+}
+
+static void
+lock_lba_range_overlapped(void)
+{
+	struct spdk_bdev *bdev;
+	struct spdk_bdev_desc *desc = NULL;
+	struct spdk_io_channel *io_ch;
+	struct spdk_bdev_channel *channel;
+	struct lba_range *range;
+	int ctx1;
+	int rc;
+
+	spdk_bdev_initialize(bdev_init_cb, NULL);
+
+	bdev = allocate_bdev("bdev0");
+
+	rc = spdk_bdev_open(bdev, true, NULL, NULL, &desc);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(desc != NULL);
+	io_ch = spdk_bdev_get_io_channel(desc);
+	CU_ASSERT(io_ch != NULL);
+	channel = spdk_io_channel_get_ctx(io_ch);
+
+	/* Lock range 20-29. */
+	g_lock_lba_range_done = false;
+	rc = bdev_lock_lba_range(desc, io_ch, 20, 10, lock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	CU_ASSERT(g_lock_lba_range_done == true);
+	range = TAILQ_FIRST(&channel->locked_ranges);
+	SPDK_CU_ASSERT_FATAL(range != NULL);
+	CU_ASSERT(range->offset == 20);
+	CU_ASSERT(range->length == 10);
+
+	/* Try to lock range 25-39.  It should not lock immediately, since it overlaps with
+	 * 20-29.
+	 */
+	g_lock_lba_range_done = false;
+	rc = bdev_lock_lba_range(desc, io_ch, 25, 15, lock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	CU_ASSERT(g_lock_lba_range_done == false);
+	range = TAILQ_FIRST(&bdev->internal.pending_locked_ranges);
+	SPDK_CU_ASSERT_FATAL(range != NULL);
+	CU_ASSERT(range->offset == 25);
+	CU_ASSERT(range->length == 15);
+
+	/* Unlock 20-29.  This should result in range 25-39 now getting locked since it
+	 * no longer overlaps with an active lock.
+	 */
+	g_unlock_lba_range_done = false;
+	rc = bdev_unlock_lba_range(desc, io_ch, 20, 10, unlock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	CU_ASSERT(g_unlock_lba_range_done == true);
+	CU_ASSERT(TAILQ_EMPTY(&bdev->internal.pending_locked_ranges));
+	range = TAILQ_FIRST(&channel->locked_ranges);
+	SPDK_CU_ASSERT_FATAL(range != NULL);
+	CU_ASSERT(range->offset == 25);
+	CU_ASSERT(range->length == 15);
+
+	/* Lock 40-59.  This should immediately lock since it does not overlap with the
+	 * currently active 25-39 lock.
+	 */
+	g_lock_lba_range_done = false;
+	rc = bdev_lock_lba_range(desc, io_ch, 40, 20, lock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	CU_ASSERT(g_lock_lba_range_done == true);
+	range = TAILQ_FIRST(&bdev->internal.locked_ranges);
+	SPDK_CU_ASSERT_FATAL(range != NULL);
+	range = TAILQ_NEXT(range, tailq);
+	SPDK_CU_ASSERT_FATAL(range != NULL);
+	CU_ASSERT(range->offset == 40);
+	CU_ASSERT(range->length == 20);
+
+	/* Try to lock 35-44.  Note that this overlaps with both 25-39 and 40-59. */
+	g_lock_lba_range_done = false;
+	rc = bdev_lock_lba_range(desc, io_ch, 35, 10, lock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	CU_ASSERT(g_lock_lba_range_done == false);
+	range = TAILQ_FIRST(&bdev->internal.pending_locked_ranges);
+	SPDK_CU_ASSERT_FATAL(range != NULL);
+	CU_ASSERT(range->offset == 35);
+	CU_ASSERT(range->length == 10);
+
+	/* Unlock 25-39.  Make sure that 35-44 is still in the pending list, since
+	 * the 40-59 lock is still active.
+	 */
+	g_unlock_lba_range_done = false;
+	rc = bdev_unlock_lba_range(desc, io_ch, 25, 15, unlock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	CU_ASSERT(g_unlock_lba_range_done == true);
+	CU_ASSERT(g_lock_lba_range_done == false);
+	range = TAILQ_FIRST(&bdev->internal.pending_locked_ranges);
+	SPDK_CU_ASSERT_FATAL(range != NULL);
+	CU_ASSERT(range->offset == 35);
+	CU_ASSERT(range->length == 10);
+
+	/* Unlock 40-59.  This should result in 35-44 now getting locked, since there are
+	 * no longer any active overlapping locks.
+	 */
+	g_unlock_lba_range_done = false;
+	rc = bdev_unlock_lba_range(desc, io_ch, 40, 20, unlock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	CU_ASSERT(g_unlock_lba_range_done == true);
+	CU_ASSERT(g_lock_lba_range_done == true);
+	CU_ASSERT(TAILQ_EMPTY(&bdev->internal.pending_locked_ranges));
+	range = TAILQ_FIRST(&bdev->internal.locked_ranges);
+	SPDK_CU_ASSERT_FATAL(range != NULL);
+	CU_ASSERT(range->offset == 35);
+	CU_ASSERT(range->length == 10);
+
+	/* Finally, unlock 35-44. */
+	g_unlock_lba_range_done = false;
+	rc = bdev_unlock_lba_range(desc, io_ch, 35, 10, unlock_lba_range_done, &ctx1);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	CU_ASSERT(g_unlock_lba_range_done == true);
+	CU_ASSERT(TAILQ_EMPTY(&bdev->internal.locked_ranges));
+
+	spdk_put_io_channel(io_ch);
+	spdk_bdev_close(desc);
+	free_bdev(bdev);
+	spdk_bdev_finish(bdev_fini_cb, NULL);
+	poll_threads();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2396,9 +3037,16 @@ main(int argc, char **argv)
 		CU_add_test(suite, "bdev_io_alignment", bdev_io_alignment) == NULL ||
 		CU_add_test(suite, "bdev_histograms", bdev_histograms) == NULL ||
 		CU_add_test(suite, "bdev_write_zeroes", bdev_write_zeroes) == NULL ||
+		CU_add_test(suite, "bdev_compare_and_write", bdev_compare_and_write) == NULL ||
 		CU_add_test(suite, "bdev_open_while_hotremove", bdev_open_while_hotremove) == NULL ||
 		CU_add_test(suite, "bdev_close_while_hotremove", bdev_close_while_hotremove) == NULL ||
-		CU_add_test(suite, "bdev_open_ext", bdev_open_ext) == NULL
+		CU_add_test(suite, "bdev_open_ext", bdev_open_ext) == NULL ||
+		CU_add_test(suite, "bdev_set_io_timeout", bdev_set_io_timeout) == NULL ||
+		CU_add_test(suite, "lba_range_overlap", lba_range_overlap) == NULL ||
+		CU_add_test(suite, "lock_lba_range_check_ranges", lock_lba_range_check_ranges) == NULL ||
+		CU_add_test(suite, "lock_lba_range_with_io_outstanding",
+			    lock_lba_range_with_io_outstanding) == NULL ||
+		CU_add_test(suite, "lock_lba_range_overlapped", lock_lba_range_overlapped) == NULL
 	) {
 		CU_cleanup_registry();
 		return CU_get_error();

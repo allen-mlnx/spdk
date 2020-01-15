@@ -146,6 +146,9 @@
   # Set whether to use the C2H Success optimization, only used for TCP transport.
   # C2HSuccess true
 
+  # Set whether to use different priority for socket, only used for TCP transport.
+  # SockPriority 0
+
 # Define FC transport
 #[Transport]
   # Set FC transport type.
@@ -198,6 +201,10 @@
   # users can set to Yes if want to enable it.
   # Default: No
   HotplugEnable No
+
+  # Enable/disable delayed NVMe command submission.
+  # Default: True.
+  DelayCmdSubmit True
 
 # The Split virtual block device slices block devices into multiple smaller bdevs.
 [Split]

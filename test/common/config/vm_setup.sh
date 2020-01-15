@@ -150,7 +150,7 @@ function install_fio()
     if echo $CONF | grep -q fio; then
         # This version of fio is installed in /usr/src/fio to enable
         # building the spdk fio plugin.
-        local fio_version="fio-3.3"
+        local fio_version="fio-3.15"
 
         # Change version on Arch Linux, 3.3 does not compile
         # with gcc 9
@@ -639,13 +639,11 @@ wait
 if [ ! -e ~/autorun-spdk.conf ]; then
 	cat > ~/autorun-spdk.conf << EOF
 # assign a value of 1 to all of the pertinent tests
-SPDK_BUILD_DOC=1
 SPDK_BUILD_SHARED_OBJECT=1
-SPDK_RUN_CHECK_FORMAT=1
-SPDK_RUN_SCANBUILD=1
 SPDK_RUN_VALGRIND=1
 SPDK_TEST_CRYPTO=1
 SPDK_RUN_FUNCTIONAL_TEST=1
+SPDK_TEST_AUTOBUILD=1
 SPDK_TEST_UNITTEST=1
 SPDK_TEST_ISCSI=1
 SPDK_TEST_ISCSI_INITIATOR=1

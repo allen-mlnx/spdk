@@ -343,7 +343,7 @@ spdk_build_eal_cmdline(const struct spdk_env_opts *opts)
 
 #if RTE_VERSION >= RTE_VERSION_NUM(18, 05, 0, 0) && RTE_VERSION < RTE_VERSION_NUM(18, 5, 1, 0)
 	/* Dynamic memory management is buggy in DPDK 18.05.0. Don't use it. */
-	if (!opts->env_context || strcmp(opts->env_context, "--legacy-mem") != 0) {
+	if (!opts->env_context || strstr(opts->env_context, "--legacy-mem") == NULL) {
 		args = spdk_push_arg(args, &argcount, _sprintf_alloc("--legacy-mem"));
 		if (args == NULL) {
 			return -1;
@@ -445,7 +445,7 @@ spdk_build_eal_cmdline(const struct spdk_env_opts *opts)
 	 * the memory for a buffer over two allocations meaning the buffer will be split over a memory region.
 	 */
 #if RTE_VERSION >= RTE_VERSION_NUM(19, 02, 0, 0)
-	if (!opts->env_context || strcmp(opts->env_context, "--legacy-mem") != 0) {
+	if (!opts->env_context || strstr(opts->env_context, "--legacy-mem") == NULL) {
 		args = spdk_push_arg(args, &argcount, _sprintf_alloc("%s", "--match-allocations"));
 		if (args == NULL) {
 			return -1;
@@ -480,13 +480,13 @@ spdk_build_eal_cmdline(const struct spdk_env_opts *opts)
 }
 
 int
-spdk_env_dpdk_post_init(void)
+spdk_env_dpdk_post_init(bool legacy_mem)
 {
 	int rc;
 
 	spdk_pci_init();
 
-	rc = spdk_mem_map_init();
+	rc = spdk_mem_map_init(legacy_mem);
 	if (rc < 0) {
 		fprintf(stderr, "Failed to allocate mem_map\n");
 		return rc;
@@ -515,6 +515,7 @@ spdk_env_init(const struct spdk_env_opts *opts)
 	char **dpdk_args = NULL;
 	int i, rc;
 	int orig_optind;
+	bool legacy_mem;
 
 	g_external_init = false;
 
@@ -570,7 +571,12 @@ spdk_env_init(const struct spdk_env_opts *opts)
 		spdk_env_unlink_shared_files();
 	}
 
-	return spdk_env_dpdk_post_init();
+	legacy_mem = false;
+	if (opts->env_context && strstr(opts->env_context, "--legacy-mem") != NULL) {
+		legacy_mem = true;
+	}
+
+	return spdk_env_dpdk_post_init(legacy_mem);
 }
 
 void

@@ -17,7 +17,6 @@ MALLOC_BLOCK_SIZE=512
 
 rpc_py="$rootdir/scripts/rpc.py"
 
-timing_enter nvme_cli
 nvmftestinit
 nvmfappstart "-m 0xF"
 
@@ -74,5 +73,3 @@ $rpc_py nvmf_delete_subsystem nqn.2016-06.io.spdk:cnode1
 trap - SIGINT SIGTERM EXIT
 
 nvmftestfini
-report_test_completion "nvmf_spdk_nvme_cli"
-timing_exit nvme_cli
